@@ -1,7 +1,7 @@
 VERSION = 3
 PATCHLEVEL = 0
 SUBLEVEL = 49
-EXTRAVERSION = -KaliForniumX-JB.4.1-BY-Liquid.Team.Cholokei
+EXTRAVERSION = -KaliForniumX-JB.4.1
 NAME = Sneaky Weasel
 
 # *DOCUMENTATION*

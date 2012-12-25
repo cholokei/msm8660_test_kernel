@@ -85,6 +85,7 @@ config ARCH_MSM8X60
 	select MSM_RPM_REGULATOR
 	select MSM_V2_TLMM
 	select MSM_PIL
+	select MSM_SCM
 	select ARCH_HAS_CPU_IDLE_WAIT
 	select MSM_DIRECT_SCLK_ACCESS
 	select MSM_RPM
@@ -147,6 +148,7 @@ config ARCH_MSM8960
 	select MSM_AUDIO_QDSP6 if SND_SOC
 	select CPU_HAS_L2_PMU
 	select MSM_SPM_V2
+	select HAS_QDSS
 	select MSM_L2_SPM
 	select MSM_NATIVE_RESTART
 	select DONT_MAP_HOLE_AFTER_MEMBANK0
@@ -349,6 +351,44 @@ config MSM_REMOTE_SPINLOCK_SFPB
 config MSM_ADM3
 	bool
 
+config PERFLOCK
+        depends on CPU_FREQ
+        depends on ARCH_MSM8960 || ARCH_MSM8X60 || ARCH_QSD8X50 || ARCH_MSM7X30 || ARCH_MSM7X00A || ARCH_MSM7X27A || ARCH_MSM7X25
+        default n
+        bool "HTC Performance Lock"
+
+config PERFLOCK_BOOT_LOCK
+        depends on PERFLOCK
+        depends on ARCH_MSM8960 || ARCH_MSM8X60 || ARCH_QSD8X50 || ARCH_MSM7X30 || ARCH_MSM7X00A || ARCH_MSM7X27A || ARCH_MSM7X25
+        default n
+        bool "Boot Time Performance Lock"
+
+config PERFLOCK_SCREEN_POLICY
+        depends on PERFLOCK
+        depends on ARCH_MSM8960 || ARCH_MSM8X60 || ARCH_QSD8X50 || ARCH_MSM7X00A || ARCH_MSM7X27A || ARCH_MSM7X25
+        default n
+        bool "Change Cpufreq Policy while Screen ON/OFF"
+
+config PERFLOCK_SCREEN_ON_MIN
+        depends on PERFLOCK_SCREEN_POLICY
+        int "Minimum speed while screen on"
+        default MSM_CPU_FREQ_MIN
+
+config PERFLOCK_SCREEN_ON_MAX
+        depends on PERFLOCK_SCREEN_POLICY
+        int "Maximum speed while screen on"
+        default MSM_CPU_FREQ_MAX
+
+config PERFLOCK_SCREEN_OFF_MIN
+        depends on PERFLOCK_SCREEN_POLICY
+        int "Minimum speed while screen off"
+        default MSM_CPU_FREQ_MIN
+
+config PERFLOCK_SCREEN_OFF_MAX
+        depends on PERFLOCK_SCREEN_POLICY
+        int "Maximum speed while screen off"
+        default 486000
+
 menu "MSM Board Selection"
 
 config MACH_HALIBUT
@@ -400,7 +440,7 @@ config MACH_MSM7X27_FFA
 config MACH_MSM7X27A_RUMI3
         depends on ARCH_MSM7X27A
         depends on !MSM_STACKED_MEMORY
-        default y
+        default n
         bool "MSM7x27A RUMI3"
         help
           Support for the Qualcomm MSM7x27A RUMI3 Emulation Platform.
@@ -408,7 +448,7 @@ config MACH_MSM7X27A_RUMI3
 config MACH_MSM7X27A_SURF
         depends on ARCH_MSM7X27A
         depends on !MSM_STACKED_MEMORY
-        default y
+        default n
         bool "MSM7x27A SURF"
         help
           Support for the Qualcomm MSM7x27A SURF.
@@ -416,7 +456,7 @@ config MACH_MSM7X27A_SURF
 config MACH_MSM7X27A_FFA
         depends on ARCH_MSM7X27A
         depends on !MSM_STACKED_MEMORY
-        default y
+        default n
         bool "MSM7x27A FFA"
         help
           Support for the Qualcomm MSM7x27A FFA.
@@ -708,6 +748,11 @@ config MACH_FSM9XXX_SURF
 	  FFA board.
 
 endmenu
+
+config MSM_MDP40
+	bool
+	depends on ARCH_MSM7X30 || ARCH_MSM8X60
+	default y
 
 config MSM_STACKED_MEMORY
 	bool "Stacked Memory"
@@ -1341,6 +1386,27 @@ config MSM_DALRPC_TEST
 	default m
 	help
 	  Exercises DAL RPC calls to QDSP6.
+
+config CPU_VOLTAGE_TABLE
+	bool "Enable CPU Voltage Table via sysfs for adjustements"
+	default n
+
+config CMDLINE_OPTIONS
+	bool "Enable cmdline khz/gov/maxscroff command parsing"
+	default n
+	help
+	  This enables the parsing of maxkhz=<VALUEinKHZ>,
+	  minkhz=<VALUEinKHZ>, governor=<GOVERNOR.NAME> and
+	  maxscroff=<VALUEinKHZ> commands from the kernels cmdline.
+	  This also enables a freq. cap while the screen is off.
+
+config MSM_MPDEC
+	bool "Enable kernel based mpdecision"
+	depends on MSM_SMP
+	default n
+	help
+	  This enables kernel based multi core control.
+	  (up/down hotplug based on load)
 
 if CPU_FREQ_MSM
 

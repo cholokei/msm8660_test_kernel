@@ -37,6 +37,26 @@
 #define DEFAULT_RQ_POLL_JIFFIES 1
 #define DEFAULT_DEF_TIMER_JIFFIES 5
 
+static unsigned init_done = 0;
+
+#ifdef CONFIG_MSM_MPDEC
+unsigned int get_rq_info(void)
+{
+	unsigned long flags = 0;
+        unsigned int rq = 0;
+
+        spin_lock_irqsave(&rq_lock, flags);
+
+        rq = rq_info.rq_avg;
+        rq_info.rq_avg = 0;
+
+        spin_unlock_irqrestore(&rq_lock, flags);
+
+        return rq;
+}
+EXPORT_SYMBOL(get_rq_info);
+#endif
+
 static void def_work_fn(struct work_struct *work)
 {
 	int64_t diff;
@@ -46,7 +66,9 @@ static void def_work_fn(struct work_struct *work)
 	rq_info.def_interval = (unsigned int) diff;
 
 	/* Notify polling threads on change of value */
-	sysfs_notify(rq_info.kobj, NULL, "def_timer_ms");
+	/* HTC Change: call sysfs_notify only when init is done */
+	if (init_done)
+		sysfs_notify(rq_info.kobj, NULL, "def_timer_ms");
 }
 
 #ifdef CONFIG_SEC_DVFS_DUAL
@@ -146,6 +168,20 @@ void dual_boost(unsigned int boost_on)
 }
 #endif
 
+static void def_work_fn(struct work_struct *work)
+{
+	int64_t diff;
+
+	diff = ktime_to_ns(ktime_get()) - rq_info.def_start_time;
+	do_div(diff, 1000 * 1000);
+	rq_info.def_interval = (unsigned int) diff;
+
+	/* Notify polling threads on change of value */
+	/* HTC Change: call sysfs_notify only when init is done */
+	if (init_done)
+		sysfs_notify(rq_info.kobj, NULL, "def_timer_ms");
+}
+
 static ssize_t show_run_queue_avg(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -203,7 +239,10 @@ static ssize_t store_run_queue_poll_ms(struct kobject *kobj,
 static ssize_t show_def_timer_ms(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	return snprintf(buf, MAX_LONG_SIZE, "%u\n", rq_info.def_interval);
+	int64_t diff_ms;
+	diff_ms = ktime_to_ns(ktime_get()) - rq_info.def_start_time;
+	do_div(diff_ms, 1000 * 1000);
+	return snprintf(buf, MAX_LONG_SIZE, "%lld\n", diff_ms);
 }
 
 static ssize_t store_def_timer_ms(struct kobject *kobj,
@@ -253,8 +292,10 @@ static int init_rq_attribs(void)
 	struct attribute **attribs =
 		kzalloc(sizeof(struct attribute *) * attr_count, GFP_KERNEL);
 
-	if (!attribs)
+	if (!attribs) {
+		pr_err("%s: Allocate attribs failed!\n", __func__);
 		goto rel;
+	}
 
 	rq_info.rq_avg = 0;
 
@@ -264,21 +305,27 @@ static int init_rq_attribs(void)
 	attribs[3] = NULL;
 
 	for (i = 0; i < attr_count - 1 ; i++) {
-		if (!attribs[i])
+		if (!attribs[i]) {
+			pr_err("%s: Allocate attribs[%d] failed!\n", __func__, i);
 			goto rel2;
+		}
 	}
 
 	rq_info.attr_group = kzalloc(sizeof(struct attribute_group),
 						GFP_KERNEL);
-	if (!rq_info.attr_group)
-		goto rel2;
+	if (!rq_info.attr_group) {
+		pr_err("%s: Allocate rq_info.attr_group failed!\n", __func__);
+		goto rel3;
+	}
 	rq_info.attr_group->attrs = attribs;
 
 	/* Create /sys/devices/system/cpu/cpu0/rq-stats/... */
 	rq_info.kobj = kobject_create_and_add("rq-stats",
 			&get_cpu_sysdev(0)->kobj);
-	if (!rq_info.kobj)
+	if (!rq_info.kobj) {
+		pr_err("%s: Create rq_info.kobj failed!\n", __func__);
 		goto rel3;
+	}
 
 	err = sysfs_create_group(rq_info.kobj, rq_info.attr_group);
 	if (err)
@@ -286,8 +333,11 @@ static int init_rq_attribs(void)
 	else
 		kobject_uevent(rq_info.kobj, KOBJ_ADD);
 
-	if (!err)
+	if (!err) {
+		pr_info("%s: Initialize done.\n", __func__);
+		init_done = 1;
 		return err;
+	}
 
 rel3:
 	kfree(rq_info.attr_group);

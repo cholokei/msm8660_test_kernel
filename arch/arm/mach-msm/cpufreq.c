@@ -57,13 +57,44 @@ static int override_cpu;
 static unsigned int upper_limit_freq = 0;
 static unsigned int lower_limit_freq = 0;
 
+unsigned int get_min_lock(void)
+{
+	return lower_limit_freq;
+}
+
+unsigned int get_max_lock(void)
+{
+	return upper_limit_freq;
+}
+
+void set_min_lock(int freq)
+{
+	if (freq <= MIN_FREQ_LIMIT)
+		lower_limit_freq = 0;
+	else if (freq > MAX_FREQ_LIMIT)
+		lower_limit_freq = 0;
+	else
+		lower_limit_freq = freq;
+}
+
+void set_max_lock(int freq)
+{
+	if (freq < MIN_FREQ_LIMIT)
+		upper_limit_freq = 0;
+	else if (freq >= MAX_FREQ_LIMIT)
+		upper_limit_freq = 0;
+	else
+		upper_limit_freq = freq;
+}
+#endif
+
 #ifdef CONFIG_CMDLINE_OPTIONS
 /*
  * start cmdline_khz
  */
 
 /* to be safe, fill vars with defaults */
-uint32_t cmdline_maxkhz = 1512000, cmdline_minkhz = 192000;
+uint32_t cmdline_maxkhz = 1566000, cmdline_minkhz = 192000;
 #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE
 char cmdline_gov[16] = "performance";
 #endif
@@ -215,6 +246,16 @@ __setup("maxscroff=", cpufreq_read_maxscroff_cmdline);
 /* end cmdline_khz */
 #endif
 
+struct cpu_freq {
+	uint32_t max;
+	uint32_t min;
+	uint32_t allowed_max;
+	uint32_t allowed_min;
+	uint32_t limits_init;
+};
+
+static DEFINE_PER_CPU(struct cpu_freq, cpu_freq_info);
+
 static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq)
 {
 	int ret = 0;
@@ -267,6 +308,34 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq)
 }
 
 #ifdef CONFIG_SMP
+static int __cpuinit msm_cpufreq_cpu_callback(struct notifier_block *nfb,
+					unsigned long action, void *hcpu)
+{
+	unsigned int cpu = (unsigned long)hcpu;
+
+	switch (action) {
+	case CPU_ONLINE:
+	case CPU_ONLINE_FROZEN:
+		per_cpu(cpufreq_suspend, cpu).device_suspended = 0;
+		break;
+	case CPU_DOWN_PREPARE:
+	case CPU_DOWN_PREPARE_FROZEN:
+		mutex_lock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
+		per_cpu(cpufreq_suspend, cpu).device_suspended = 1;
+		mutex_unlock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
+		break;
+	case CPU_DOWN_FAILED:
+	case CPU_DOWN_FAILED_FROZEN:
+		per_cpu(cpufreq_suspend, cpu).device_suspended = 0;
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block __refdata msm_cpufreq_cpu_notifier = {
+	.notifier_call = msm_cpufreq_cpu_callback,
+};
+
 static void set_cpu_work(struct work_struct *work)
 {
 	struct cpufreq_work_struct *cpu_work =
@@ -295,13 +364,7 @@ static void msm_cpufreq_early_suspend(struct early_suspend *h)
 			}
 		}
 		mutex_unlock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
-		break;
-	case CPU_DOWN_FAILED:
-	case CPU_DOWN_FAILED_FROZEN:
-		per_cpu(cpufreq_suspend, cpu).device_suspended = 0;
-		break;
 	}
-	return NOTIFY_OK;
 }
 
 static void msm_cpufreq_late_resume(struct early_suspend *h)
@@ -394,6 +457,7 @@ static int msm_cpufreq_target(struct cpufreq_policy *policy,
 		wait_for_completion(&cpu_work->complete);
 	}
 
+	free_cpumask_var(mask);
 	ret = cpu_work->status;
 #else
 	ret = set_cpu_freq(policy, table[index].frequency);

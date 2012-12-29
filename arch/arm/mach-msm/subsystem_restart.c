@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -17,52 +17,199 @@
 #include <linux/uaccess.h>
 #include <linux/module.h>
 #include <linux/fs.h>
-#include <linux/proc_fs.h>
 #include <linux/delay.h>
 #include <linux/list.h>
 #include <linux/io.h>
 #include <linux/kthread.h>
 #include <linux/time.h>
+#include <linux/wakelock.h>
+#include <linux/suspend.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/device.h>
+#include <linux/idr.h>
+#include <linux/debugfs.h>
 
 #include <asm/current.h>
 
-#include <mach/peripheral-loader.h>
-#include <mach/scm.h>
 #include <mach/socinfo.h>
 #include <mach/subsystem_notif.h>
 #include <mach/subsystem_restart.h>
 
 #include "smd_private.h"
-#ifdef CONFIG_SEC_DEBUG
-#include <mach/sec_debug.h>
-#endif
 
+/**
+ * enum p_subsys_state - state of a subsystem (private)
+ * @SUBSYS_NORMAL: subsystem is operating normally
+ * @SUBSYS_CRASHED: subsystem has crashed and hasn't been shutdown
+ * @SUBSYS_RESTARTING: subsystem has been shutdown and is now restarting
+ *
+ * The 'private' side of the subsytem state used to determine where in the
+ * restart process the subsystem is.
+ */
+enum p_subsys_state {
+	SUBSYS_NORMAL,
+	SUBSYS_CRASHED,
+	SUBSYS_RESTARTING,
+};
+
+/**
+ * enum subsys_state - state of a subsystem (public)
+ * @SUBSYS_OFFLINE: subsystem is offline
+ * @SUBSYS_ONLINE: subsystem is online
+ *
+ * The 'public' side of the subsytem state, exposed to userspace.
+ */
+enum subsys_state {
+	SUBSYS_OFFLINE,
+	SUBSYS_ONLINE,
+};
+
+static const char * const subsys_states[] = {
+	[SUBSYS_OFFLINE] = "OFFLINE",
+	[SUBSYS_ONLINE] = "ONLINE",
+};
+
+/**
+ * struct subsys_tracking - track state of a subsystem or restart order
+ * @p_state: private state of subsystem/order
+ * @state: public state of subsystem/order
+ * @s_lock: protects p_state
+ * @lock: protects subsystem/order callbacks and state
+ *
+ * Tracks the state of a subsystem or a set of subsystems (restart order).
+ * Doing this avoids the need to grab each subsystem's lock and update
+ * each subsystems state when restarting an order.
+ */
+struct subsys_tracking {
+	enum p_subsys_state p_state;
+	spinlock_t s_lock;
+	enum subsys_state state;
+	struct mutex lock;
+};
+
+/**
+ * struct subsys_soc_restart_order - subsystem restart order
+ * @subsystem_list: names of subsystems in this restart order
+ * @count: number of subsystems in order
+ * @track: state tracking and locking
+ * @subsys_ptrs: pointers to subsystems in this restart order
+ */
 struct subsys_soc_restart_order {
 	const char * const *subsystem_list;
 	int count;
 
-	struct mutex shutdown_lock;
-	struct mutex powerup_lock;
-	struct subsys_data *subsys_ptrs[];
-};
-
-struct restart_thread_data {
-	struct subsys_data *subsys;
-	int coupled;
+	struct subsys_tracking track;
+	struct subsys_device *subsys_ptrs[];
 };
 
 struct restart_log {
 	struct timeval time;
-	struct subsys_data *subsys;
+	struct subsys_device *dev;
 	struct list_head list;
 };
 
-static int restart_level;
+/**
+ * struct subsys_device - subsystem device
+ * @desc: subsystem descriptor
+ * @wake_lock: prevents suspend during subsystem_restart()
+ * @wlname: name of @wake_lock
+ * @work: context for subsystem_restart_wq_func() for this device
+ * @track: state tracking and locking
+ * @notify: subsys notify handle
+ * @dev: device
+ * @owner: module that provides @desc
+ * @count: reference count of subsystem_get()/subsystem_put()
+ * @id: ida
+ * @restart_order: order of other devices this devices restarts with
+ * @dentry: debugfs directory for this device
+ */
+struct subsys_device {
+	struct subsys_desc *desc;
+	struct wake_lock wake_lock;
+	char wlname[64];
+	struct work_struct work;
+
+	struct subsys_tracking track;
+
+	void *notify;
+	struct device dev;
+	struct module *owner;
+	int count;
+	int id;
+	struct subsys_soc_restart_order *restart_order;
+#ifdef CONFIG_DEBUG_FS
+	struct dentry *dentry;
+#endif
+};
+
+static struct subsys_device *to_subsys(struct device *d)
+{
+	return container_of(d, struct subsys_device, dev);
+}
+
+static ssize_t name_show(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%s\n", to_subsys(dev)->desc->name);
+}
+
+static ssize_t state_show(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	enum subsys_state state = to_subsys(dev)->track.state;
+	return snprintf(buf, PAGE_SIZE, "%s\n", subsys_states[state]);
+}
+
+static void subsys_set_state(struct subsys_device *subsys,
+			     enum subsys_state state)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&subsys->track.s_lock, flags);
+	if (subsys->track.state != state) {
+		subsys->track.state = state;
+		spin_unlock_irqrestore(&subsys->track.s_lock, flags);
+		sysfs_notify(&subsys->dev.kobj, NULL, "state");
+		return;
+	}
+	spin_unlock_irqrestore(&subsys->track.s_lock, flags);
+}
+
+/**
+ * subsytem_default_online() - Mark a subsystem as online by default
+ * @dev: subsystem to mark as online
+ *
+ * Marks a subsystem as "online" without increasing the reference count
+ * on the subsystem. This is typically used by subsystems that are already
+ * online when the kernel boots up.
+ */
+void subsys_default_online(struct subsys_device *dev)
+{
+	subsys_set_state(dev, SUBSYS_ONLINE);
+}
+EXPORT_SYMBOL(subsys_default_online);
+
+static struct device_attribute subsys_attrs[] = {
+	__ATTR_RO(name),
+	__ATTR_RO(state),
+	__ATTR_NULL,
+};
+
+static struct bus_type subsys_bus_type = {
+	.name		= "msm_subsys",
+	.dev_attrs	= subsys_attrs,
+};
+
+static DEFINE_IDA(subsys_ida);
+
 static int enable_ramdumps;
+module_param(enable_ramdumps, int, S_IRUGO | S_IWUSR);
+
+struct workqueue_struct *ssr_wq;
 
 static LIST_HEAD(restart_log_list);
-static LIST_HEAD(subsystem_list);
-static DEFINE_MUTEX(subsystem_list_lock);
 static DEFINE_MUTEX(soc_order_reg_lock);
 static DEFINE_MUTEX(restart_log_mutex);
 
@@ -80,25 +227,26 @@ static DEFINE_MUTEX(restart_log_mutex);
 
 /* MSM 8x60 restart ordering info */
 static const char * const _order_8x60_all[] = {
-	"external_modem",  "modem", "lpass"
+	"external_modem",  "modem", "adsp"
 };
 DEFINE_SINGLE_RESTART_ORDER(orders_8x60_all, _order_8x60_all);
 
 static const char * const _order_8x60_modems[] = {"external_modem", "modem"};
 DEFINE_SINGLE_RESTART_ORDER(orders_8x60_modems, _order_8x60_modems);
 
-/* MSM 8960 restart ordering info */
-static const char * const order_8960[] = {"modem", "lpass"};
+/*SGLTE restart ordering info*/
+static const char * const order_8960_sglte[] = {"external_modem",
+						"modem"};
 
-static struct subsys_soc_restart_order restart_orders_8960_one = {
-	.subsystem_list = order_8960,
-	.count = ARRAY_SIZE(order_8960),
-	.subsys_ptrs = {[ARRAY_SIZE(order_8960)] = NULL}
+static struct subsys_soc_restart_order restart_orders_8960_fusion_sglte = {
+	.subsystem_list = order_8960_sglte,
+	.count = ARRAY_SIZE(order_8960_sglte),
+	.subsys_ptrs = {[ARRAY_SIZE(order_8960_sglte)] = NULL}
 	};
 
-static struct subsys_soc_restart_order *restart_orders_8960[] = {
-	&restart_orders_8960_one,
-};
+static struct subsys_soc_restart_order *restart_orders_8960_sglte[] = {
+	&restart_orders_8960_fusion_sglte,
+	};
 
 /* These will be assigned to one of the sets above after
  * runtime SoC identification.
@@ -106,36 +254,13 @@ static struct subsys_soc_restart_order *restart_orders_8960[] = {
 static struct subsys_soc_restart_order **restart_orders;
 static int n_restart_orders;
 
-module_param(enable_ramdumps, int, S_IRUGO | S_IWUSR);
-
-static struct subsys_soc_restart_order *_update_restart_order(
-		struct subsys_data *subsys);
+static int restart_level = RESET_SOC;
 
 int get_restart_level()
 {
 	return restart_level;
 }
 EXPORT_SYMBOL(get_restart_level);
-
-static void restart_level_changed(void)
-{
-	struct subsys_data *subsys;
-
-	if (cpu_is_msm8x60() && restart_level == RESET_SUBSYS_COUPLED) {
-		restart_orders = orders_8x60_all;
-		n_restart_orders = ARRAY_SIZE(orders_8x60_all);
-	}
-
-	if (cpu_is_msm8x60() && restart_level == RESET_SUBSYS_MIXED) {
-		restart_orders = orders_8x60_modems;
-		n_restart_orders = ARRAY_SIZE(orders_8x60_modems);
-	}
-
-	mutex_lock(&subsystem_list_lock);
-	list_for_each_entry(subsys, &subsystem_list, list)
-		subsys->restart_order = _update_restart_order(subsys);
-	mutex_unlock(&subsystem_list_lock);
-}
 
 static int restart_level_set(const char *val, struct kernel_param *kp)
 {
@@ -152,88 +277,48 @@ static int restart_level_set(const char *val, struct kernel_param *kp)
 		return ret;
 
 	switch (restart_level) {
-
-	case RESET_SOC:
-	case RESET_SUBSYS_COUPLED:
 	case RESET_SUBSYS_INDEPENDENT:
-		pr_info("Subsystem Restart: Phase %d behavior activated.\n", restart_level);
-	break;
-
-	case RESET_SUBSYS_MIXED:
-		pr_info("Subsystem Restart: Phase 2+ behavior activated.\n");
-	break;
-
+		if (socinfo_get_platform_subtype() == PLATFORM_SUBTYPE_SGLTE) {
+			pr_info("Phase 3 is currently unsupported. Using phase 2 instead.\n");
+			restart_level = RESET_SUBSYS_COUPLED;
+		}
+	case RESET_SUBSYS_COUPLED:
+	case RESET_SOC:
+		pr_info("Phase %d behavior activated.\n", restart_level);
+		break;
 	default:
 		restart_level = old_val;
 		return -EINVAL;
-	break;
-
 	}
-
-	if (restart_level != old_val)
-		restart_level_changed();
-
 	return 0;
 }
 
 module_param_call(restart_level, restart_level_set, param_get_int,
 			&restart_level, 0644);
 
-static struct subsys_data *_find_subsystem(const char *subsys_name)
-{
-	struct subsys_data *subsys;
-
-	mutex_lock(&subsystem_list_lock);
-	list_for_each_entry(subsys, &subsystem_list, list)
-		if (!strncmp(subsys->name, subsys_name,
-				SUBSYS_NAME_MAX_LENGTH)) {
-			mutex_unlock(&subsystem_list_lock);
-			return subsys;
-		}
-	mutex_unlock(&subsystem_list_lock);
-
-	return NULL;
-}
-
-static struct subsys_soc_restart_order *_update_restart_order(
-		struct subsys_data *subsys)
+static struct subsys_soc_restart_order *
+update_restart_order(struct subsys_device *dev)
 {
 	int i, j;
-
-	if (!subsys)
-		return NULL;
-
-	if (!subsys->name)
-		return NULL;
+	struct subsys_soc_restart_order *order;
+	const char *name = dev->desc->name;
+	int len = SUBSYS_NAME_MAX_LENGTH;
 
 	mutex_lock(&soc_order_reg_lock);
 	for (j = 0; j < n_restart_orders; j++) {
-		for (i = 0; i < restart_orders[j]->count; i++)
-			if (!strncmp(restart_orders[j]->subsystem_list[i],
-				subsys->name, SUBSYS_NAME_MAX_LENGTH)) {
-
-					restart_orders[j]->subsys_ptrs[i] =
-						subsys;
-					mutex_unlock(&soc_order_reg_lock);
-					return restart_orders[j];
+		order = restart_orders[j];
+		for (i = 0; i < order->count; i++) {
+			if (!strncmp(order->subsystem_list[i], name, len)) {
+				order->subsys_ptrs[i] = dev;
+				goto found;
 			}
+		}
 	}
-
+	order = NULL;
+found:
 	mutex_unlock(&soc_order_reg_lock);
 
-	return NULL;
-}
-
-static void _send_notification_to_order(struct subsys_data
-			**restart_list, int count,
-			enum subsys_notif_type notif_type)
-{
-	int i;
-
-	for (i = 0; i < count; i++)
-		if (restart_list[i])
-			subsys_notif_queue_notification(
-				restart_list[i]->notif_handle, notif_type);
+	return order;
 }
 
 static int max_restarts;
@@ -242,7 +327,7 @@ module_param(max_restarts, int, 0644);
 static long max_history_time = 3600;
 module_param(max_history_time, long, 0644);
 
-static void do_epoch_check(struct subsys_data *subsys)
+static void do_epoch_check(struct subsys_device *dev)
 {
 	int n = 0;
 	struct timeval *time_first = NULL, *curr_time;
@@ -262,7 +347,7 @@ static void do_epoch_check(struct subsys_data *subsys)
 	r_log = kmalloc(sizeof(struct restart_log), GFP_KERNEL);
 	if (!r_log)
 		goto out;
-	r_log->subsys = subsys;
+	r_log->dev = dev;
 	do_gettimeofday(&r_log->time);
 	curr_time = &r_log->time;
 	INIT_LIST_HEAD(&r_log->list);
@@ -300,261 +385,530 @@ out:
 	mutex_unlock(&restart_log_mutex);
 }
 
-static int subsystem_restart_thread(void *data)
+static void for_each_subsys_device(struct subsys_device **list, unsigned count,
+		void *data, void (*fn)(struct subsys_device *, void *))
 {
-	struct restart_thread_data *r_work = data;
-	struct subsys_data **restart_list;
-	struct subsys_data *subsys = r_work->subsys;
-	struct subsys_soc_restart_order *soc_restart_order = NULL;
+	while (count--) {
+		struct subsys_device *dev = *list++;
+		if (!dev)
+			continue;
+		fn(dev, data);
+	}
+}
 
-	struct mutex *powerup_lock;
-	struct mutex *shutdown_lock;
+static void __send_notification_to_order(struct subsys_device *dev, void *data)
+{
+	enum subsys_notif_type type = (enum subsys_notif_type)data;
 
-	int i;
-	int restart_list_count = 0;
+	subsys_notif_queue_notification(dev->notify, type);
+}
 
-	if (r_work->coupled)
-		soc_restart_order = subsys->restart_order;
+static void send_notification_to_order(struct subsys_device **l, unsigned n,
+		enum subsys_notif_type t)
+{
+	for_each_subsys_device(l, n, (void *)t, __send_notification_to_order);
+}
 
-	/* It's OK to not take the registration lock at this point.
+static void subsystem_shutdown(struct subsys_device *dev, void *data)
+{
+	const char *name = dev->desc->name;
+
+	pr_info("[%p]: Shutting down %s\n", current, name);
+	if (dev->desc->shutdown(dev->desc) < 0)
+		panic("subsys-restart: [%p]: Failed to shutdown %s!",
+			current, name);
+	subsys_set_state(dev, SUBSYS_OFFLINE);
+}
+
+static void subsystem_ramdump(struct subsys_device *dev, void *data)
+{
+	const char *name = dev->desc->name;
+
+	if (dev->desc->ramdump)
+		if (dev->desc->ramdump(enable_ramdumps, dev->desc) < 0)
+			pr_warn("%s[%p]: Ramdump failed.\n", name, current);
+}
+
+static void subsystem_powerup(struct subsys_device *dev, void *data)
+{
+	const char *name = dev->desc->name;
+
+	pr_info("[%p]: Powering up %s\n", current, name);
+	if (dev->desc->powerup(dev->desc) < 0)
+		panic("[%p]: Failed to powerup %s!", current, name);
+	subsys_set_state(dev, SUBSYS_ONLINE);
+}
+
+static int __find_subsys(struct device *dev, void *data)
+{
+	struct subsys_device *subsys = to_subsys(dev);
+	return !strcmp(subsys->desc->name, data);
+}
+
+static struct subsys_device *find_subsys(const char *str)
+{
+	struct device *dev;
+
+	if (!str)
+		return NULL;
+
+	dev = bus_find_device(&subsys_bus_type, NULL, (void *)str,
+			__find_subsys);
+	return dev ? to_subsys(dev) : NULL;
+}
+
+static int subsys_start(struct subsys_device *subsys)
+{
+	int ret;
+
+	ret = subsys->desc->start(subsys->desc);
+	if (!ret)
+		subsys_set_state(subsys, SUBSYS_ONLINE);
+
+	return ret;
+}
+
+static void subsys_stop(struct subsys_device *subsys)
+{
+	subsys->desc->stop(subsys->desc);
+	subsys_set_state(subsys, SUBSYS_OFFLINE);
+}
+
+static struct subsys_tracking *subsys_get_track(struct subsys_device *subsys)
+{
+	struct subsys_soc_restart_order *order = subsys->restart_order;
+
+	if (restart_level != RESET_SUBSYS_INDEPENDENT && order)
+		return &order->track;
+	else
+		return &subsys->track;
+}
+
+/**
+ * subsytem_get() - Boot a subsystem
+ * @name: pointer to a string containing the name of the subsystem to boot
+ *
+ * This function returns a pointer if it succeeds. If an error occurs an
+ * ERR_PTR is returned.
+ *
+ * If this feature is disable, the value %NULL will be returned.
+ */
+void *subsystem_get(const char *name)
+{
+	struct subsys_device *subsys;
+	struct subsys_device *subsys_d;
+	int ret;
+	void *retval;
+	struct subsys_tracking *track;
+
+	if (!name)
+		return NULL;
+
+	subsys = retval = find_subsys(name);
+	if (!subsys)
+		return ERR_PTR(-ENODEV);
+	if (!try_module_get(subsys->owner)) {
+		retval = ERR_PTR(-ENODEV);
+		goto err_module;
+	}
+
+	subsys_d = subsystem_get(subsys->desc->depends_on);
+	if (IS_ERR(subsys_d)) {
+		retval = subsys_d;
+		goto err_depends;
+	}
+
+	track = subsys_get_track(subsys);
+	mutex_lock(&track->lock);
+	if (!subsys->count) {
+		ret = subsys_start(subsys);
+		if (ret) {
+			retval = ERR_PTR(ret);
+			goto err_start;
+		}
+	}
+	subsys->count++;
+	mutex_unlock(&track->lock);
+	return retval;
+err_start:
+	mutex_unlock(&track->lock);
+	subsystem_put(subsys_d);
+err_depends:
+	module_put(subsys->owner);
+err_module:
+	put_device(&subsys->dev);
+	return retval;
+}
+EXPORT_SYMBOL(subsystem_get);
+
+/**
+ * subsystem_put() - Shutdown a subsystem
+ * @peripheral_handle: pointer from a previous call to subsystem_get()
+ *
+ * This doesn't imply that a subsystem is shutdown until all callers of
+ * subsystem_get() have called subsystem_put().
+ */
+void subsystem_put(void *subsystem)
+{
+	struct subsys_device *subsys_d, *subsys = subsystem;
+	struct subsys_tracking *track;
+
+	if (IS_ERR_OR_NULL(subsys))
+		return;
+
+	track = subsys_get_track(subsys);
+	mutex_lock(&track->lock);
+	if (WARN(!subsys->count, "%s: %s: Reference count mismatch\n",
+			subsys->desc->name, __func__))
+		goto err_out;
+	if (!--subsys->count)
+		subsys_stop(subsys);
+	mutex_unlock(&track->lock);
+
+	subsys_d = find_subsys(subsys->desc->depends_on);
+	if (subsys_d) {
+		subsystem_put(subsys_d);
+		put_device(&subsys_d->dev);
+	}
+	module_put(subsys->owner);
+	put_device(&subsys->dev);
+	return;
+err_out:
+	mutex_unlock(&track->lock);
+}
+EXPORT_SYMBOL(subsystem_put);
+
+static void subsystem_restart_wq_func(struct work_struct *work)
+{
+	struct subsys_device *dev = container_of(work,
+						struct subsys_device, work);
+	struct subsys_device **list;
+	struct subsys_desc *desc = dev->desc;
+	struct subsys_soc_restart_order *order = dev->restart_order;
+	struct subsys_tracking *track;
+	unsigned count;
+	unsigned long flags;
+
+	/*
+	 * It's OK to not take the registration lock at this point.
 	 * This is because the subsystem list inside the relevant
 	 * restart order is not being traversed.
 	 */
-	if (!soc_restart_order) {
-		restart_list = subsys->single_restart_list;
-		restart_list_count = 1;
-		powerup_lock = &subsys->powerup_lock;
-		shutdown_lock = &subsys->shutdown_lock;
+	if (restart_level != RESET_SUBSYS_INDEPENDENT && order) {
+		list = order->subsys_ptrs;
+		count = order->count;
+		track = &order->track;
 	} else {
-		restart_list = soc_restart_order->subsys_ptrs;
-		restart_list_count = soc_restart_order->count;
-		powerup_lock = &soc_restart_order->powerup_lock;
-		shutdown_lock = &soc_restart_order->shutdown_lock;
+		list = &dev;
+		count = 1;
+		track = &dev->track;
 	}
 
-	pr_debug("[%p]: Attempting to get shutdown lock!\n", current);
+	mutex_lock(&track->lock);
+	do_epoch_check(dev);
 
-	/* Try to acquire shutdown_lock. If this fails, these subsystems are
-	 * already being restarted - return.
-	 */
-	if (!mutex_trylock(shutdown_lock)) {
-		kfree(data);
-		do_exit(0);
-	}
-
-	pr_debug("[%p]: Attempting to get powerup lock!\n", current);
-
-	/* Now that we've acquired the shutdown lock, either we're the first to
-	 * restart these subsystems or some other thread is doing the powerup
-	 * sequence for these subsystems. In the latter case, panic and bail
-	 * out, since a subsystem died in its powerup sequence.
-	 */
-	if (!mutex_trylock(powerup_lock))
-		panic("%s[%p]: Subsystem died during powerup!",
-						__func__, current);
-
-	do_epoch_check(subsys);
-
-	/* Now it is necessary to take the registration lock. This is because
-	 * the subsystem list in the SoC restart order will be traversed
-	 * and it shouldn't be changed until _this_ restart sequence completes.
+	/*
+	 * It's necessary to take the registration lock because the subsystem
+	 * list in the SoC restart order will be traversed and it shouldn't be
+	 * changed until _this_ restart sequence completes.
 	 */
 	mutex_lock(&soc_order_reg_lock);
 
 	pr_debug("[%p]: Starting restart sequence for %s\n", current,
-			r_work->subsys->name);
+			desc->name);
+	send_notification_to_order(list, count, SUBSYS_BEFORE_SHUTDOWN);
+	for_each_subsys_device(list, count, NULL, subsystem_shutdown);
+	send_notification_to_order(list, count, SUBSYS_AFTER_SHUTDOWN);
 
-	_send_notification_to_order(restart_list,
-				restart_list_count,
-				SUBSYS_BEFORE_SHUTDOWN);
-
-	for (i = 0; i < restart_list_count; i++) {
-
-		if (!restart_list[i])
-			continue;
-
-		pr_info("[%p]: Shutting down %s\n", current,
-			restart_list[i]->name);
-
-		if (restart_list[i]->shutdown(subsys) < 0)
-			panic("subsys-restart: %s[%p]: Failed to shutdown %s!",
-				__func__, current, restart_list[i]->name);
-	}
-
-	_send_notification_to_order(restart_list, restart_list_count,
-				SUBSYS_AFTER_SHUTDOWN);
-
-	/* Now that we've finished shutting down these subsystems, release the
-	 * shutdown lock. If a subsystem restart request comes in for a
-	 * subsystem in _this_ restart order after the unlock below, and
-	 * before the powerup lock is released, panic and bail out.
-	 */
-	mutex_unlock(shutdown_lock);
+	spin_lock_irqsave(&track->s_lock, flags);
+	track->p_state = SUBSYS_RESTARTING;
+	spin_unlock_irqrestore(&track->s_lock, flags);
 
 	/* Collect ram dumps for all subsystems in order here */
-	for (i = 0; i < restart_list_count; i++) {
-		if (!restart_list[i])
-			continue;
+	for_each_subsys_device(list, count, NULL, subsystem_ramdump);
 
-		if (restart_list[i]->ramdump)
-			if (restart_list[i]->ramdump(enable_ramdumps,
-							subsys) < 0)
-				pr_warn("%s[%p]: Ramdump failed.\n",
-						restart_list[i]->name, current);
-	}
-
-	_send_notification_to_order(restart_list,
-			restart_list_count,
-			SUBSYS_BEFORE_POWERUP);
-
-	for (i = restart_list_count - 1; i >= 0; i--) {
-
-		if (!restart_list[i])
-			continue;
-
-		pr_info("[%p]: Powering up %s\n", current,
-					restart_list[i]->name);
-
-		if (restart_list[i]->powerup(subsys) < 0)
-			panic("%s[%p]: Failed to powerup %s!", __func__,
-				current, restart_list[i]->name);
-	}
-
-	_send_notification_to_order(restart_list,
-				restart_list_count,
-				SUBSYS_AFTER_POWERUP);
+	send_notification_to_order(list, count, SUBSYS_BEFORE_POWERUP);
+	for_each_subsys_device(list, count, NULL, subsystem_powerup);
+	send_notification_to_order(list, count, SUBSYS_AFTER_POWERUP);
 
 	pr_info("[%p]: Restart sequence for %s completed.\n",
-			current, r_work->subsys->name);
-
-	mutex_unlock(powerup_lock);
+			current, desc->name);
 
 	mutex_unlock(&soc_order_reg_lock);
+	mutex_unlock(&track->lock);
 
-	pr_debug("[%p]: Released powerup lock!\n", current);
-
-	kfree(data);
-	do_exit(0);
+	spin_lock_irqsave(&track->s_lock, flags);
+	track->p_state = SUBSYS_NORMAL;
+	wake_unlock(&dev->wake_lock);
+	spin_unlock_irqrestore(&track->s_lock, flags);
 }
 
-int subsystem_restart(const char *subsys_name)
+static void __subsystem_restart_dev(struct subsys_device *dev)
 {
-	struct subsys_data *subsys;
-	struct task_struct *tsk;
-	struct restart_thread_data *data = NULL;
+	struct subsys_desc *desc = dev->desc;
+	const char *name = dev->desc->name;
+	struct subsys_tracking *track;
+	unsigned long flags;
 
-	if (!subsys_name) {
-		pr_err("Invalid subsystem name.\n");
-		return -EINVAL;
+	pr_debug("Restarting %s [level=%d]!\n", desc->name, restart_level);
+
+	track = subsys_get_track(dev);
+	/*
+	 * Allow drivers to call subsystem_restart{_dev}() as many times as
+	 * they want up until the point where the subsystem is shutdown.
+	 */
+	spin_lock_irqsave(&track->s_lock, flags);
+	if (track->p_state != SUBSYS_CRASHED) {
+		if (dev->track.state == SUBSYS_ONLINE &&
+		    track->p_state != SUBSYS_RESTARTING) {
+			track->p_state = SUBSYS_CRASHED;
+			wake_lock(&dev->wake_lock);
+			queue_work(ssr_wq, &dev->work);
+		} else {
+			panic("Subsystem %s crashed during SSR!", name);
+		}
+	}
+	spin_unlock_irqrestore(&track->s_lock, flags);
+}
+
+int subsystem_restart_dev(struct subsys_device *dev)
+{
+	const char *name;
+
+	if (!get_device(&dev->dev))
+		return -ENODEV;
+
+	if (!try_module_get(dev->owner)) {
+		put_device(&dev->dev);
+		return -ENODEV;
+	}
+
+	name = dev->desc->name;
+
+	/*
+	 * If a system reboot/shutdown is underway, ignore subsystem errors.
+	 * However, print a message so that we know that a subsystem behaved
+	 * unexpectedly here.
+	 */
+	if (system_state == SYSTEM_RESTART
+		|| system_state == SYSTEM_POWER_OFF) {
+		pr_err("%s crashed during a system poweroff/shutdown.\n", name);
+		return -EBUSY;
 	}
 
 	pr_info("Restart sequence requested for %s, restart_level = %d.\n",
-		subsys_name, restart_level);
-
-	/* List of subsystems is protected by a lock. New subsystems can
-	 * still come in.
-	 */
-	subsys = _find_subsystem(subsys_name);
-
-	if (!subsys) {
-		pr_warn("Unregistered subsystem %s!\n", subsys_name);
-		return -EINVAL;
-	}
-
-	if (restart_level != RESET_SOC) {
-		data = kzalloc(sizeof(struct restart_thread_data), GFP_KERNEL);
-		if (!data) {
-			restart_level = RESET_SOC;
-			pr_warn("Failed to alloc restart data. Resetting.\n");
-		} else {
-			if (restart_level == RESET_SUBSYS_COUPLED ||
-					restart_level == RESET_SUBSYS_MIXED)
-				data->coupled = 1;
-			else
-				data->coupled = 0;
-
-			data->subsys = subsys;
-		}
-	}
+		name, restart_level);
 
 	switch (restart_level) {
 
 	case RESET_SUBSYS_COUPLED:
-	case RESET_SUBSYS_MIXED:
 	case RESET_SUBSYS_INDEPENDENT:
-		pr_debug("Restarting %s [level=%d]!\n", subsys_name,
-				restart_level);
-
-		/* Let the kthread handle the actual restarting. Using a
-		 * workqueue will not work since all restart requests are
-		 * serialized and it prevents the short circuiting of
-		 * restart requests for subsystems already in a restart
-		 * sequence.
-		 */
-		tsk = kthread_run(subsystem_restart_thread, data,
-				"subsystem_restart_thread");
-		if (IS_ERR(tsk))
-			panic("%s: Unable to create thread to restart %s",
-				__func__, subsys->name);
-
+		__subsystem_restart_dev(dev);
 		break;
-
 	case RESET_SOC:
-		panic(subsys_name);
+		panic("subsys-restart: Resetting the SoC - %s crashed.", name);
 		break;
-
 	default:
 		panic("subsys-restart: Unknown restart level!\n");
-	break;
-
+		break;
 	}
+	module_put(dev->owner);
+	put_device(&dev->dev);
 
 	return 0;
+}
+EXPORT_SYMBOL(subsystem_restart_dev);
+
+int subsystem_restart(const char *name)
+{
+	int ret;
+	struct subsys_device *dev = find_subsys(name);
+
+	if (!dev)
+		return -ENODEV;
+
+	ret = subsystem_restart_dev(dev);
+	put_device(&dev->dev);
+	return ret;
 }
 EXPORT_SYMBOL(subsystem_restart);
 
-int ssr_register_subsystem(struct subsys_data *subsys)
+#ifdef CONFIG_DEBUG_FS
+static ssize_t subsys_debugfs_read(struct file *filp, char __user *ubuf,
+		size_t cnt, loff_t *ppos)
 {
-	if (!subsys)
-		goto err;
+	int r;
+	char buf[40];
+	struct subsys_device *subsys = filp->private_data;
 
-	if (!subsys->name)
-		goto err;
-
-	if (!subsys->powerup || !subsys->shutdown)
-		goto err;
-
-	subsys->notif_handle = subsys_notif_add_subsys(subsys->name);
-	subsys->restart_order = _update_restart_order(subsys);
-	subsys->single_restart_list[0] = subsys;
-
-	mutex_init(&subsys->shutdown_lock);
-	mutex_init(&subsys->powerup_lock);
-
-	mutex_lock(&subsystem_list_lock);
-	list_add(&subsys->list, &subsystem_list);
-	mutex_unlock(&subsystem_list_lock);
-
-	return 0;
-
-err:
-	return -EINVAL;
+	r = snprintf(buf, sizeof(buf), "%d\n", subsys->count);
+	return simple_read_from_buffer(ubuf, cnt, ppos, buf, r);
 }
-EXPORT_SYMBOL(ssr_register_subsystem);
+
+static ssize_t subsys_debugfs_write(struct file *filp,
+		const char __user *ubuf, size_t cnt, loff_t *ppos)
+{
+	struct subsys_device *subsys = filp->private_data;
+	char buf[10];
+	char *cmp;
+
+	cnt = min(cnt, sizeof(buf) - 1);
+	if (copy_from_user(&buf, ubuf, cnt))
+		return -EFAULT;
+	buf[cnt] = '\0';
+	cmp = strstrip(buf);
+
+	if (!strcmp(cmp, "restart")) {
+		if (subsystem_restart_dev(subsys))
+			return -EIO;
+	} else if (!strcmp(cmp, "get")) {
+		if (subsystem_get(subsys->desc->name))
+			return -EIO;
+	} else if (!strcmp(cmp, "put")) {
+		subsystem_put(subsys);
+	} else {
+		return -EINVAL;
+	}
+
+	return cnt;
+}
+
+static const struct file_operations subsys_debugfs_fops = {
+	.open	= simple_open,
+	.read	= subsys_debugfs_read,
+	.write	= subsys_debugfs_write,
+};
+
+static struct dentry *subsys_base_dir;
+
+static int __init subsys_debugfs_init(void)
+{
+	subsys_base_dir = debugfs_create_dir("msm_subsys", NULL);
+	return !subsys_base_dir ? -ENOMEM : 0;
+}
+
+static void subsys_debugfs_exit(void)
+{
+	debugfs_remove_recursive(subsys_base_dir);
+}
+
+static int subsys_debugfs_add(struct subsys_device *subsys)
+{
+	if (!subsys_base_dir)
+		return -ENOMEM;
+
+	subsys->dentry = debugfs_create_file(subsys->desc->name,
+				S_IRUGO | S_IWUSR, subsys_base_dir,
+				subsys, &subsys_debugfs_fops);
+	return !subsys->dentry ? -ENOMEM : 0;
+}
+
+static void subsys_debugfs_remove(struct subsys_device *subsys)
+{
+	debugfs_remove(subsys->dentry);
+}
+#else
+static int __init subsys_debugfs_init(void) { return 0; };
+static void subsys_debugfs_exit(void) { }
+static int subsys_debugfs_add(struct subsys_device *subsys) { return 0; }
+static void subsys_debugfs_remove(struct subsys_device *subsys) { }
+#endif
+
+static void subsys_device_release(struct device *dev)
+{
+	struct subsys_device *subsys = to_subsys(dev);
+
+	wake_lock_destroy(&subsys->wake_lock);
+	mutex_destroy(&subsys->track.lock);
+	ida_simple_remove(&subsys_ida, subsys->id);
+	kfree(subsys);
+}
+
+struct subsys_device *subsys_register(struct subsys_desc *desc)
+{
+	struct subsys_device *subsys;
+	int ret;
+
+	subsys = kzalloc(sizeof(*subsys), GFP_KERNEL);
+	if (!subsys)
+		return ERR_PTR(-ENOMEM);
+
+	subsys->desc = desc;
+	subsys->owner = desc->owner;
+	subsys->dev.parent = desc->dev;
+	subsys->dev.bus = &subsys_bus_type;
+	subsys->dev.release = subsys_device_release;
+
+	subsys->notify = subsys_notif_add_subsys(desc->name);
+	subsys->restart_order = update_restart_order(subsys);
+
+	snprintf(subsys->wlname, sizeof(subsys->wlname), "ssr(%s)", desc->name);
+	wake_lock_init(&subsys->wake_lock, WAKE_LOCK_SUSPEND, subsys->wlname);
+	INIT_WORK(&subsys->work, subsystem_restart_wq_func);
+	spin_lock_init(&subsys->track.s_lock);
+
+	subsys->id = ida_simple_get(&subsys_ida, 0, 0, GFP_KERNEL);
+	if (subsys->id < 0) {
+		ret = subsys->id;
+		goto err_ida;
+	}
+	dev_set_name(&subsys->dev, "subsys%d", subsys->id);
+
+	mutex_init(&subsys->track.lock);
+
+	ret = subsys_debugfs_add(subsys);
+	if (ret)
+		goto err_debugfs;
+
+	ret = device_register(&subsys->dev);
+	if (ret) {
+		put_device(&subsys->dev);
+		goto err_register;
+	}
+
+	return subsys;
+
+err_register:
+	subsys_debugfs_remove(subsys);
+err_debugfs:
+	mutex_destroy(&subsys->track.lock);
+	ida_simple_remove(&subsys_ida, subsys->id);
+err_ida:
+	wake_lock_destroy(&subsys->wake_lock);
+	kfree(subsys);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL(subsys_register);
+
+void subsys_unregister(struct subsys_device *subsys)
+{
+	if (IS_ERR_OR_NULL(subsys))
+		return;
+
+	if (get_device(&subsys->dev)) {
+		mutex_lock(&subsys->track.lock);
+		WARN_ON(subsys->count);
+		device_unregister(&subsys->dev);
+		mutex_unlock(&subsys->track.lock);
+		subsys_debugfs_remove(subsys);
+		put_device(&subsys->dev);
+	}
+}
+EXPORT_SYMBOL(subsys_unregister);
+
+static int subsys_panic(struct device *dev, void *data)
+{
+	struct subsys_device *subsys = to_subsys(dev);
+
+	if (subsys->desc->crash_shutdown)
+		subsys->desc->crash_shutdown(subsys->desc);
+	return 0;
+}
 
 static int ssr_panic_handler(struct notifier_block *this,
 				unsigned long event, void *ptr)
 {
-	struct subsys_data *subsys;
-
-#if defined(CONFIG_SEC_DEBUG)
-	if(sec_debug_is_enabled()) // Skip ssr_panic_handler when the device is going to upload mode.
-		return NOTIFY_DONE;
-#endif
-	
-	list_for_each_entry(subsys, &subsystem_list, list)
-		if (subsys->crash_shutdown)
-			subsys->crash_shutdown(subsys);
+	bus_for_each_dev(&subsys_bus_type, NULL, NULL, subsys_panic);
 	return NOTIFY_DONE;
 }
 
@@ -571,48 +925,61 @@ static int __init ssr_init_soc_restart_orders(void)
 
 	if (cpu_is_msm8x60()) {
 		for (i = 0; i < ARRAY_SIZE(orders_8x60_all); i++) {
-			mutex_init(&orders_8x60_all[i]->powerup_lock);
-			mutex_init(&orders_8x60_all[i]->shutdown_lock);
+			mutex_init(&orders_8x60_all[i]->track.lock);
+			spin_lock_init(&orders_8x60_all[i]->track.s_lock);
 		}
 
 		for (i = 0; i < ARRAY_SIZE(orders_8x60_modems); i++) {
-			mutex_init(&orders_8x60_modems[i]->powerup_lock);
-			mutex_init(&orders_8x60_modems[i]->shutdown_lock);
+			mutex_init(&orders_8x60_modems[i]->track.lock);
+			spin_lock_init(&orders_8x60_modems[i]->track.s_lock);
 		}
 
 		restart_orders = orders_8x60_all;
 		n_restart_orders = ARRAY_SIZE(orders_8x60_all);
 	}
 
-	if (cpu_is_msm8960() || cpu_is_msm8930() || cpu_is_msm9615()) {
-		restart_orders = restart_orders_8960;
-		n_restart_orders = ARRAY_SIZE(restart_orders_8960);
+	if (socinfo_get_platform_subtype() == PLATFORM_SUBTYPE_SGLTE) {
+		restart_orders = restart_orders_8960_sglte;
+		n_restart_orders = ARRAY_SIZE(restart_orders_8960_sglte);
 	}
 
-	if (restart_orders == NULL || n_restart_orders < 1) {
-		WARN_ON(1);
-		return -EINVAL;
+	for (i = 0; i < n_restart_orders; i++) {
+		mutex_init(&restart_orders[i]->track.lock);
+		spin_lock_init(&restart_orders[i]->track.s_lock);
 	}
+
+	if (restart_orders == NULL || n_restart_orders < 1)
+		WARN_ON(1);
 
 	return 0;
 }
 
 static int __init subsys_restart_init(void)
 {
-	int ret = 0;
+	int ret;
 
-#if defined(CONFIG_SEC_DEBUG)
-	if(!sec_debug_is_enabled()) // if debug_level is low, silrent reset is activated.
-		restart_level = RESET_SUBSYS_COUPLED;
-	else
-#endif
-	restart_level = RESET_SOC;
+	ssr_wq = alloc_workqueue("ssr_wq", WQ_CPU_INTENSIVE, 0);
+	BUG_ON(!ssr_wq);
 
+	ret = bus_register(&subsys_bus_type);
+	if (ret)
+		goto err_bus;
+	ret = subsys_debugfs_init();
+	if (ret)
+		goto err_debugfs;
 	ret = ssr_init_soc_restart_orders();
+	if (ret)
+		goto err_soc;
+	return 0;
 
+err_soc:
+	subsys_debugfs_exit();
+err_debugfs:
+	bus_unregister(&subsys_bus_type);
+err_bus:
+	destroy_workqueue(ssr_wq);
 	return ret;
 }
-
 arch_initcall(subsys_restart_init);
 
 MODULE_DESCRIPTION("Subsystem Restart Driver");

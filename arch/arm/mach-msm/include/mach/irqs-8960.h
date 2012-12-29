@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -14,13 +14,6 @@
 #define __ASM_ARCH_MSM_IRQS_8960_H
 
 /* MSM ACPU Interrupt Numbers */
-
-/* 0-15:  STI/SGI (software triggered/generated interrupts)
-   16-31: PPI (private peripheral interrupts)
-   32+:   SPI (shared peripheral interrupts) */
-
-#define GIC_PPI_START 16
-#define GIC_SPI_START 32
 
 #define INT_VGIC				(GIC_PPI_START + 0)
 #define INT_DEBUG_TIMER_EXP			(GIC_PPI_START + 1)
@@ -268,6 +261,8 @@
 #define PM8921_SEC_IRQ_104			(GIC_SPI_START + 225)
 #define PM8018_SEC_IRQ_107			(GIC_SPI_START + 226)
 #define USB_HSIC_IRQ				(GIC_SPI_START + 229)
+#define MSM8960_CSIPHY_2_2LN_IRQ		(GIC_SPI_START + 228)
+#define CSI_2_IRQ				(GIC_SPI_START + 227)
 
 /* Backwards compatible IRQ macros. */
 #define INT_ADM_AARM				ADM_0_SCSS_0_IRQ

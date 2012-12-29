@@ -180,7 +180,7 @@ static int input_handle_abs_event(struct input_dev *dev,
 		return INPUT_IGNORE_EVENT;
 	}
 
-	is_mt_event = code >= ABS_MT_FIRST && code <= ABS_MT_LAST;
+	is_mt_event = input_is_mt_value(code);
 
 	if (!is_mt_event) {
 		pold = &dev->absinfo[code].value;
@@ -1624,7 +1624,7 @@ static struct device_type input_dev_type = {
 #endif
 };
 
-static char *input_devnode(struct device *dev, mode_t *mode)
+static char *input_devnode(struct device *dev, umode_t *mode)
 {
 	return kasprintf(GFP_KERNEL, "input/%s", dev_name(dev));
 }
@@ -1858,12 +1858,9 @@ int input_register_device(struct input_dev *dev)
 		return error;
 
 	path = kobject_get_path(&dev->dev.kobj, GFP_KERNEL);
-
-#if !defined(CONFIG_USA_MODEL_SGH_I727R)
 	pr_info("%s as %s\n",
 		dev->name ? dev->name : "Unspecified device",
 		path ? path : "N/A");
-#endif
 	kfree(path);
 
 	error = mutex_lock_interruptible(&input_mutex);

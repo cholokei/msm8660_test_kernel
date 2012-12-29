@@ -32,8 +32,6 @@
 #include "mdp.h"
 #include "msm_fb.h"
 #include "mdp4.h"
-#include <mach/sec_debug.h>
-#include <asm/cacheflush.h>
 
 #ifdef CONFIG_FB_MSM_MDP40
 #define LCDC_BASE	0xC0000
@@ -173,6 +171,8 @@ int mdp4_lcdc_pipe_commit(int cndx, int wait)
 	vp = &vctrl->vlist[undx];
 	pipe = vctrl->base_pipe;
 	mixer = pipe->mixer_num;
+
+	mdp_update_pm(vctrl->mfd, vctrl->vsync_time);
 
 	if (vp->update_cnt == 0) {
 		mutex_unlock(&vctrl->update_lock);
@@ -361,13 +361,14 @@ static void mdp4_lcdc_wait4ov(int cndx)
 	wait_for_completion(&vctrl->ov_comp);
 }
 
-static ssize_t vsync_show_event(struct device *dev,
+ssize_t mdp4_lcdc_show_event(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	int cndx;
 	struct vsycn_ctrl *vctrl;
 	ssize_t ret = 0;
 	unsigned long flags;
+	u64 vsync_tick;
 
 	cndx = 0;
 	vctrl = &vsync_ctrl_db[0];
@@ -381,10 +382,18 @@ static ssize_t vsync_show_event(struct device *dev,
 		INIT_COMPLETION(vctrl->vsync_comp);
 	vctrl->wait_vsync_cnt++;
 	spin_unlock_irqrestore(&vctrl->spin_lock, flags);
-	wait_for_completion_timeout(&vctrl->vsync_comp, msecs_to_jiffies(1000));
+	ret = wait_for_completion_interruptible_timeout(&vctrl->vsync_comp,
+		msecs_to_jiffies(VSYNC_PERIOD * 4));
+	if (ret <= 0) {
+		vctrl->wait_vsync_cnt = 0;
+		return -EBUSY;
+	}
 
-	ret = snprintf(buf, PAGE_SIZE, "VSYNC=%llu",
-			ktime_to_ns(vctrl->vsync_time));
+	spin_lock_irqsave(&vctrl->spin_lock, flags);
+	vsync_tick = ktime_to_ns(vctrl->vsync_time);
+	spin_unlock_irqrestore(&vctrl->spin_lock, flags);
+
+	ret = snprintf(buf, PAGE_SIZE, "VSYNC=%llu", vsync_tick);
 	buf[strlen(buf) + 1] = '\0';
 	return ret;
 }
@@ -410,7 +419,7 @@ void mdp4_lcdc_vsync_init(int cndx)
 	init_completion(&vctrl->vsync_comp);
 	init_completion(&vctrl->dmap_comp);
 	init_completion(&vctrl->ov_comp);
-	atomic_set(&vctrl->suspend, 0);
+	atomic_set(&vctrl->suspend, 1);
 	atomic_set(&vctrl->vsync_resume, 1);
 	spin_lock_init(&vctrl->spin_lock);
 }
@@ -427,15 +436,6 @@ void mdp4_lcdc_base_swap(int cndx, struct mdp4_overlay_pipe *pipe)
 	vctrl = &vsync_ctrl_db[cndx];
 	vctrl->base_pipe = pipe;
 }
-
-static DEVICE_ATTR(vsync_event, S_IRUGO, vsync_show_event, NULL);
-static struct attribute *vsync_fs_attrs[] = {
-	&dev_attr_vsync_event.attr,
-	NULL,
-};
-static struct attribute_group vsync_fs_attr_group = {
-	.attrs = vsync_fs_attrs,
-};
 
 int mdp4_lcdc_on(struct platform_device *pdev)
 {
@@ -527,6 +527,7 @@ int mdp4_lcdc_on(struct platform_device *pdev)
 		pipe = vctrl->base_pipe;
 	}
 
+
 	pipe->src_height = fbi->var.yres;
 	pipe->src_width = fbi->var.xres;
 	pipe->src_h = fbi->var.yres;
@@ -535,14 +536,11 @@ int mdp4_lcdc_on(struct platform_device *pdev)
 	pipe->src_x = 0;
 	pipe->dst_h = fbi->var.yres;
 	pipe->dst_w = fbi->var.xres;
-	if (mfd->map_buffer) {
-		pipe->srcp0_addr = (unsigned int)mfd->map_buffer->iova[0] + \
-			buf_offset;
-		pr_debug("start 0x%lx srcp0_addr 0x%x\n", mfd->
-			map_buffer->iova[0], pipe->srcp0_addr);
-	} else {
+
+	if (mfd->display_iova)
+		pipe->srcp0_addr = mfd->display_iova + buf_offset;
+	else
 		pipe->srcp0_addr = (uint32)(buf + buf_offset);
-	}
 
 	pipe->srcp0_ystride = fbi->fix.line_length;
 	pipe->bpp = bpp;
@@ -573,18 +571,17 @@ int mdp4_lcdc_on(struct platform_device *pdev)
 	lcdc_underflow_clr = mfd->panel_info.lcdc.underflow_clr;
 	lcdc_hsync_skew = mfd->panel_info.lcdc.hsync_skew;
 
-	pr_info("%s: <ID=%d %dx%d (%d,%d,%d), (%d,%d,%d) %dMHz>\n", __func__,
-		var->reserved[3], var->xres, var->yres,
-		var->right_margin, var->hsync_len, var->left_margin,
-		var->lower_margin, var->vsync_len, var->upper_margin,
-		var->pixclock/1000/1000);
-
 	lcdc_width = var->xres + mfd->panel_info.lcdc.xres_pad;
 	lcdc_height = var->yres + mfd->panel_info.lcdc.yres_pad;
 	lcdc_bpp = mfd->panel_info.bpp;
 
 	hsync_period =
-	    hsync_pulse_width + h_back_porch + lcdc_width + h_front_porch;
+	    hsync_pulse_width + h_back_porch + h_front_porch;
+	if ((mfd->panel_info.type == LVDS_PANEL) &&
+		(mfd->panel_info.lvds.channel_mode == LVDS_DUAL_CHANNEL_MODE))
+		hsync_period += lcdc_width / 2;
+	else
+		hsync_period += lcdc_width;
 	hsync_ctrl = (hsync_period << 16) | hsync_pulse_width;
 	hsync_start_x = hsync_pulse_width + h_back_porch;
 	hsync_end_x = hsync_period - h_front_porch - 1;
@@ -619,18 +616,19 @@ int mdp4_lcdc_on(struct platform_device *pdev)
 
 
 #ifdef CONFIG_FB_MSM_MDP40
-	hsync_polarity = 1;
-	vsync_polarity = 1;
+	if (mfd->panel_info.lcdc.is_sync_active_high) {
+		hsync_polarity = 0;
+		vsync_polarity = 0;
+	} else {
+		hsync_polarity = 1;
+		vsync_polarity = 1;
+	}
 	lcdc_underflow_clr |= 0x80000000;	/* enable recovery */
 #else
 	hsync_polarity = 0;
 	vsync_polarity = 0;
 #endif
-#ifdef CONFIG_SAMSUNG_8X60_TABLET
 	data_en_polarity = 0;
-#else
-	data_en_polarity = 1;
-#endif
 
 	ctrl_polarity =
 	    (data_en_polarity << 2) | (vsync_polarity << 1) | (hsync_polarity);
@@ -652,20 +650,6 @@ int mdp4_lcdc_on(struct platform_device *pdev)
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 
 	mdp_histogram_ctrl_all(TRUE);
-
-	if (!vctrl->sysfs_created) {
-		ret = sysfs_create_group(&vctrl->dev->kobj,
-			&vsync_fs_attr_group);
-		if (ret) {
-			pr_err("%s: sysfs group creation failed, ret=%d\n",
-				__func__, ret);
-			return ret;
-		}
-
-		kobject_uevent(&vctrl->dev->kobj, KOBJ_ADD);
-		pr_debug("%s: kobject_uevent(KOBJ_ADD)\n", __func__);
-		vctrl->sysfs_created = 1;
-	}
 
 	return ret;
 }
@@ -701,11 +685,11 @@ int mdp4_lcdc_off(struct platform_device *pdev)
 			mdp4_lcdc_wait4ov(0);
 	}
 
+	mdp_histogram_ctrl_all(FALSE);
+
 	MDP_OUTP(MDP_BASE + LCDC_BASE, 0);
 
 	lcdc_enabled = 0;
-
-	mdp_histogram_ctrl_all(FALSE);
 
 	if (vctrl->vsync_irq_enabled) {
 		vctrl->vsync_irq_enabled = 0;
@@ -807,9 +791,11 @@ void mdp4_primary_vsync_lcdc(void)
 
 	cndx = 0;
 	vctrl = &vsync_ctrl_db[cndx];
-	vctrl->vsync_time = ktime_get();
+	pr_debug("%s: cpu=%d\n", __func__, smp_processor_id());
 
 	spin_lock(&vctrl->spin_lock);
+	vctrl->vsync_time = ktime_get();
+
 	if (vctrl->wait_vsync_cnt) {
 		complete_all(&vctrl->vsync_comp);
 		vctrl->wait_vsync_cnt = 0;
@@ -891,7 +877,6 @@ void mdp4_overlay0_done_lcdc(int cndx)
 
 static void mdp4_lcdc_do_blt(struct msm_fb_data_type *mfd, int enable)
 {
-	static int porch_value_read = 0;
 	unsigned long flag;
 	int cndx = 0;
 	struct vsycn_ctrl *vctrl;
@@ -972,15 +957,16 @@ void mdp4_lcdc_overlay(struct msm_fb_data_type *mfd)
 		return;
 	}
 
+	pr_debug("%s: cpu=%d pid=%d\n", __func__,
+			smp_processor_id(), current->pid);
 	if (pipe->pipe_type == OVERLAY_TYPE_RGB) {
 		bpp = fbi->var.bits_per_pixel / 8;
 		buf = (uint8 *) fbi->fix.smem_start;
 		buf_offset = calc_fb_offset(mfd, fbi, bpp);
 
-		if (mfd->map_buffer->iova[0]) {
-			pipe->srcp0_addr = mfd->map_buffer->iova[0]
-				+ buf_offset;
-		} else
+		if (mfd->display_iova)
+			pipe->srcp0_addr = mfd->display_iova + buf_offset;
+		else
 			pipe->srcp0_addr = (uint32)(buf + buf_offset);
 
 		mdp4_lcdc_pipe_queue(0, pipe);

@@ -45,7 +45,7 @@
  */
 union ktime {
 	s64	tv64;
-//#if BITS_PER_LONG != 64 && !defined(CONFIG_KTIME_SCALAR) //subbu@siso: temporarily disabled this check to resolve compilation error in vibrator module
+#if BITS_PER_LONG != 64 && !defined(CONFIG_KTIME_SCALAR)
 	struct {
 # ifdef __BIG_ENDIAN
 	s32	sec, nsec;
@@ -53,10 +53,17 @@ union ktime {
 	s32	nsec, sec;
 # endif
 	} tv;
-//#endif
+#endif
 };
 
 typedef union ktime ktime_t;		/* Kill this */
+
+#define KTIME_MAX			((s64)~((u64)1 << 63))
+#if (BITS_PER_LONG == 64)
+# define KTIME_SEC_MAX			(KTIME_MAX / NSEC_PER_SEC)
+#else
+# define KTIME_SEC_MAX			LONG_MAX
+#endif
 
 /*
  * ktime_t definitions when using the 64-bit scalar representation:
@@ -74,7 +81,6 @@ typedef union ktime ktime_t;		/* Kill this */
 static inline ktime_t ktime_set(const long secs, const unsigned long nsecs)
 {
 #if (BITS_PER_LONG == 64)
-
 	if (unlikely(secs >= KTIME_SEC_MAX))
 		return (ktime_t){ .tv64 = KTIME_MAX };
 #endif

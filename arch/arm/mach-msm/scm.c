@@ -196,6 +196,7 @@ static int __scm_call(const struct scm_command *cmd)
 	 * side in the buffer.
 	 */
 	flush_cache_all();
+	outer_flush_all();
 	ret = smc(cmd_addr);
 	if (ret < 0)
 		ret = scm_remap_error(ret);
@@ -203,12 +204,16 @@ static int __scm_call(const struct scm_command *cmd)
 	return ret;
 }
 
-static u32 cacheline_size;
-
 static void scm_inv_range(unsigned long start, unsigned long end)
 {
+	u32 cacheline_size, ctr;
+
+	asm volatile("mrc p15, 0, %0, c0, c0, 1" : "=r" (ctr));
+	cacheline_size = 4 << ((ctr >> 16) & 0xf);
+
 	start = round_down(start, cacheline_size);
 	end = round_up(end, cacheline_size);
+	outer_inv_range(start, end);
 	while (start < end) {
 		asm ("mcr p15, 0, %0, c7, c6, 1" : : "r" (start)
 		     : "memory");
@@ -429,13 +434,16 @@ int scm_is_call_available(u32 svc_id, u32 cmd_id)
 }
 EXPORT_SYMBOL(scm_is_call_available);
 
-static int scm_init(void)
+#define GET_FEAT_VERSION_CMD	3
+int scm_get_feat_version(u32 feat)
 {
-	u32 ctr;
-
-	asm volatile("mrc p15, 0, %0, c0, c0, 1" : "=r" (ctr));
-	cacheline_size =  4 << ((ctr >> 16) & 0xf);
-
+	if (scm_is_call_available(SCM_SVC_INFO, GET_FEAT_VERSION_CMD)) {
+		u32 version;
+		if (!scm_call(SCM_SVC_INFO, GET_FEAT_VERSION_CMD, &feat,
+				sizeof(feat), &version, sizeof(version)))
+			return version;
+	}
 	return 0;
 }
-early_initcall(scm_init);
+EXPORT_SYMBOL(scm_get_feat_version);
+

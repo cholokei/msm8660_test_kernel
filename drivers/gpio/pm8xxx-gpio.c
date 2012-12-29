@@ -1,7 +1,7 @@
 /*
  * Qualcomm PMIC8XXX GPIO driver
  *
- * Copyright (c) 2011, Code Aurora Forum. All rights reserved.
+ * Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -15,6 +15,7 @@
 
 #define pr_fmt(fmt)	"%s: " fmt, __func__
 
+#include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/gpio.h>
 #include <linux/mfd/pm8xxx/core.h>
@@ -241,7 +242,7 @@ static void pm_gpio_dbg_show(struct seq_file *s, struct gpio_chip *gpio_chip)
 	struct pm_gpio_chip *pm_gpio_chip = dev_get_drvdata(gpio_chip->dev);
 	u8 mode, state, bank;
 	const char *label;
-	int i, j, rc;
+	int i, j;
 
 	for (i = 0; i < gpio_chip->ngpio; i++) {
 		label = gpiochip_is_requested(gpio_chip, i);
@@ -256,19 +257,12 @@ static void pm_gpio_dbg_show(struct seq_file *s, struct gpio_chip *gpio_chip)
 				state ? "hi" : "lo");
 		for (j = 0; j < PM_GPIO_BANKS; j++) {
 			bank = j << PM_GPIO_BANK_SHIFT;
-			rc = pm8xxx_writeb(gpio_chip->dev->parent,
+			pm8xxx_writeb(gpio_chip->dev->parent,
 					SSBI_REG_ADDR_GPIO(i),
 					bank);
-			if (rc)
-				 pr_err("pm8xxx_writeb failed(pm_gpio_dbg_show), rc=%d\n", rc);
-
-			rc=pm8xxx_readb(gpio_chip->dev->parent,
+			pm8xxx_readb(gpio_chip->dev->parent,
 					SSBI_REG_ADDR_GPIO(i),
 					&bank);
-					
-			if (rc)
-				 pr_err("pm8xxx_readb failed(pm_gpio_dbg_show), rc=%d\n", rc);
-				 
 			seq_printf(s, " 0x%02x", bank);
 		}
 		seq_printf(s, "\n");
@@ -309,7 +303,7 @@ static int __devinit pm_gpio_probe(struct platform_device *pdev)
 	pm_gpio_chip->gpio_chip.set = pm_gpio_write;
 	pm_gpio_chip->gpio_chip.dbg_show = pm_gpio_dbg_show;
 	pm_gpio_chip->gpio_chip.ngpio = pdata->gpio_cdata.ngpios;
-	pm_gpio_chip->gpio_chip.can_sleep = 1;
+	pm_gpio_chip->gpio_chip.can_sleep = 0;
 	pm_gpio_chip->gpio_chip.dev = &pdev->dev;
 	pm_gpio_chip->gpio_chip.base = pdata->gpio_base;
 	pm_gpio_chip->irq_base = platform_get_irq(pdev, 0);

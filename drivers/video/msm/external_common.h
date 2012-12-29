@@ -9,21 +9,10 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
- *
  */
 #ifndef __EXTERNAL_COMMON_H__
 #define __EXTERNAL_COMMON_H__
-
-#define QCT_SWITCH_STATE_CMD
-#ifdef QCT_SWITCH_STATE_CMD
 #include <linux/switch.h>
-#endif
-
-#define DEV_INFO_ENA
 
 #ifdef DEBUG
 #ifndef DEV_DBG_PREFIX
@@ -31,17 +20,11 @@
 #endif
 #define DEV_DBG(args...)	pr_debug(DEV_DBG_PREFIX args)
 #else
-#define DEV_DBG(args...)	dev_info(external_common_state->dev, args)
+#define DEV_DBG(args...)	(void)0
 #endif /* DEBUG */
-#ifdef DEV_INFO_ENA
 #define DEV_INFO(args...)	dev_info(external_common_state->dev, args)
-#define DEV_WARN(args...)	dev_info(external_common_state->dev, args)
-#define DEV_ERR(args...)	dev_info(external_common_state->dev, args)
-#else
-#define DEV_INFO(args...)	 do {} while (0)
-#define DEV_WARN(args...)	 do {} while (0)
-#define DEV_ERR(args...)	 do {} while (0)
-#endif
+#define DEV_WARN(args...)	dev_warn(external_common_state->dev, args)
+#define DEV_ERR(args...)	dev_err(external_common_state->dev, args)
 
 #ifdef CONFIG_FB_MSM_TVOUT
 #define TVOUT_VFRMT_NTSC_M_720x480i		0
@@ -129,6 +112,8 @@
 #define HDMI_VFRMT_MAX			59
 #define HDMI_VFRMT_FORCE_32BIT		0x7FFFFFFF
 
+extern int ext_resolution;
+
 struct hdmi_disp_mode_timing_type {
 	uint32	video_format;
 	uint32	active_h;
@@ -170,15 +155,9 @@ struct hdmi_disp_mode_timing_type {
 #define HDMI_SETTINGS_1440x480i60_16_9					\
 	{HDMI_VFRMT_1440x480i60_16_9,    1440, 38,  124, 114, TRUE,	\
 	 240, 4, 3, 15, TRUE, 27000, 60000, TRUE, TRUE}
-#if !defined(CONFIG_VIDEO_MHL_V1) && !defined(CONFIG_VIDEO_MHL_V2) && !defined(CONFIG_VIDEO_MHL_TABLET_V1)
 #define HDMI_SETTINGS_1920x1080p60_16_9					\
 	{HDMI_VFRMT_1920x1080p60_16_9,   1920, 88,  44,  148,  FALSE,	\
 	 1080, 4, 5, 36, FALSE, 148500, 60000, FALSE, TRUE}
-#else // due to MHL limitation, 1080p60 is not supported - jgk.20111214
-#define HDMI_SETTINGS_1920x1080p60_16_9					\
-	{HDMI_VFRMT_1920x1080p60_16_9,   1920, 88,  44,  148,  FALSE,	\
-	 1080, 4, 5, 36, FALSE, 148500, 60000, FALSE, FALSE}
-#endif
 #define HDMI_SETTINGS_720x576p50_4_3					\
 	{HDMI_VFRMT_720x576p50_4_3,      720,  12,  64,  68,   TRUE,	\
 	 576,  5, 5, 39, TRUE, 27000, 50000, FALSE, TRUE}
@@ -194,30 +173,15 @@ struct hdmi_disp_mode_timing_type {
 #define HDMI_SETTINGS_1440x576i50_16_9					\
 	{HDMI_VFRMT_1440x576i50_16_9,    1440, 24,  126, 138,  TRUE,	\
 	 288,  2, 3, 19, TRUE, 27000, 50000, TRUE, TRUE}
-#if !defined(CONFIG_VIDEO_MHL_V1) && !defined(CONFIG_VIDEO_MHL_V2) && !defined(CONFIG_VIDEO_MHL_TABLET_V1)
 #define HDMI_SETTINGS_1920x1080p50_16_9					\
 	{HDMI_VFRMT_1920x1080p50_16_9,   1920,  528,  44,  148,  FALSE,	\
 	 1080, 4, 5, 36, FALSE, 148500, 50000, FALSE, TRUE}
-#else // due to MHL limitation, 1080p60 is not supported - jgk.20111214
-#define HDMI_SETTINGS_1920x1080p50_16_9					\
-	{HDMI_VFRMT_1920x1080p50_16_9,   1920,  528,  44,  148,  FALSE,	\
-	 1080, 4, 5, 36, FALSE, 148500, 50000, FALSE, FALSE}
-#endif
-#ifdef CONFIG_VIDEO_MHL_TABLET_V1
-#define HDMI_SETTINGS_1920x1080p24_16_9					\
-	{HDMI_VFRMT_1920x1080p24_16_9,   1920,  638,  44,  148,  FALSE,	\
-	 1080, 4, 5, 36, FALSE, 74250, 24000, FALSE, FALSE}
-#define HDMI_SETTINGS_1920x1080p25_16_9					\
-	{HDMI_VFRMT_1920x1080p25_16_9,   1920,  528,  44,  148,  FALSE,	\
-	 1080, 4, 5, 36, FALSE, 74250, 25000, FALSE, FALSE}
-#else
 #define HDMI_SETTINGS_1920x1080p24_16_9					\
 	{HDMI_VFRMT_1920x1080p24_16_9,   1920,  638,  44,  148,  FALSE,	\
 	 1080, 4, 5, 36, FALSE, 74250, 24000, FALSE, TRUE}
 #define HDMI_SETTINGS_1920x1080p25_16_9					\
 	{HDMI_VFRMT_1920x1080p25_16_9,   1920,  528,  44,  148,  FALSE,	\
 	 1080, 4, 5, 36, FALSE, 74250, 25000, FALSE, TRUE}
-#endif
 #define HDMI_SETTINGS_1920x1080p30_16_9					\
 	{HDMI_VFRMT_1920x1080p30_16_9,   1920,  88,   44,  148,  FALSE,	\
 	 1080, 4, 5, 36, FALSE, 74250, 30000, FALSE, TRUE}
@@ -232,6 +196,12 @@ extern struct hdmi_disp_mode_timing_type
  * device */
 struct hdmi_disp_mode_list_type {
 	uint32	disp_mode_list[HDMI_VFRMT_MAX];
+#define TOP_AND_BOTTOM		0x10
+#define FRAME_PACKING		0x20
+#define SIDE_BY_SIDE_HALF	0x40
+	uint32	disp_3d_mode_list[HDMI_VFRMT_MAX];
+	uint32	disp_multi_3d_mode_list[16];
+	uint32	disp_multi_3d_mode_list_cnt;
 	uint32	num_of_elements;
 };
 #endif
@@ -240,10 +210,10 @@ struct external_common_state_type {
 	boolean hpd_state;
 	struct kobject *uevent_kobj;
 	uint32 video_resolution;
+	boolean default_res_supported;
 	struct device *dev;
-#ifdef QCT_SWITCH_STATE_CMD
 	struct switch_dev sdev;
-#endif
+	struct switch_dev audio_sdev;
 #ifdef CONFIG_FB_MSM_HDMI_3D
 	boolean format_3d;
 	void (*switch_3d)(boolean on);
@@ -256,6 +226,13 @@ struct external_common_state_type {
 	uint8 speaker_allocation_block;
 	uint16 video_latency, audio_latency;
 	uint8 audio_data_block_cnt;
+	uint16 physical_address;
+	uint32 preferred_video_format;
+	uint8 pt_scan_info;
+	uint8 it_scan_info;
+	uint8 ce_scan_info;
+	uint8 spd_vendor_name[8];
+	uint8 spd_product_description[16];
 	boolean present_3d;
 	boolean present_hdcp;
 	uint32 audio_data_blocks[16];
@@ -289,6 +266,8 @@ const struct hdmi_disp_mode_timing_type *hdmi_mhl_get_mode(uint32 mode);
 const struct hdmi_disp_mode_timing_type *hdmi_mhl_get_supported_mode(
 	uint32 mode);
 void hdmi_common_init_panel_info(struct msm_panel_info *pinfo);
+
+ssize_t video_3d_format_2string(uint32 format, char *buf);
 #endif
 
 int external_common_state_create(struct platform_device *pdev);

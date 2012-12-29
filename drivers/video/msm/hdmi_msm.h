@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -13,9 +13,7 @@
 #ifndef __HDMI_MSM_H__
 #define __HDMI_MSM_H__
 
-#include <linux/switch.h>
 #include <mach/msm_iomap.h>
-#include <linux/wakelock.h>
 #include "external_common.h"
 /* #define PORT_DEBUG */
 
@@ -34,9 +32,6 @@ uint32 hdmi_inp(uint32 offset);
 #define HDMI_INP_ND(offset)		inpdw(MSM_HDMI_BASE+(offset))
 #define HDMI_INP(offset)		inpdw(MSM_HDMI_BASE+(offset))
 #endif
-
-// a software workaround for a potential HW problem with HDMI which exists on V1 and V2 8660 units
-#define WORKAROUND_FOR_HDMI_CURRENT_LEAKAGE_FIX
 
 
 /*
@@ -61,22 +56,17 @@ struct hdmi_msm_state_type {
 #ifdef CONFIG_SUSPEND
 	boolean pm_suspended;
 #endif
-	int hpd_stable;
-	boolean hpd_prev_state;
-	boolean hpd_cable_chg_detected;
 	boolean full_auth_done;
 	boolean hpd_during_auth;
-	struct work_struct hpd_state_work, hpd_read_work;
-	struct timer_list hpd_state_timer;
+	struct work_struct hpd_state_work;
 	struct completion ddc_sw_done;
 
-#ifdef CONFIG_FB_MSM_HDMI_MSM_PANEL_HDCP_SUPPORT
+	bool hdcp_enable;
 	boolean hdcp_activating;
 	boolean reauth ;
 	struct work_struct hdcp_reauth_work, hdcp_work;
 	struct completion hdcp_success_done;
 	struct timer_list hdcp_timer;
-#endif /* CONFIG_FB_MSM_HDMI_MSM_PANEL_HDCP_SUPPORT */
 
 #ifdef CONFIG_FB_MSM_HDMI_MSM_PANEL_CEC_SUPPORT
 	boolean cec_enabled;
@@ -103,7 +93,7 @@ struct hdmi_msm_state_type {
 
 #define CEC_QUEUE_SIZE		16
 #define CEC_QUEUE_END	 (hdmi_msm_state->cec_queue_start + CEC_QUEUE_SIZE)
-#define RETRANSMIT_MAX_NUM	7
+#define RETRANSMIT_MAX_NUM	5
 #endif /* CONFIG_FB_MSM_HDMI_MSM_PANEL_CEC_SUPPORT */
 
 	int irq;
@@ -115,17 +105,7 @@ struct hdmi_msm_state_type {
 	void __iomem *hdmi_io;
 
 	struct external_common_state_type common;
-#if defined(CONFIG_VIDEO_MHL_V1) || defined(CONFIG_VIDEO_MHL_V2) || defined(CONFIG_VIDEO_MHL_TABLET_V1)
-	struct switch_dev	hdmi_audio_ch;
-#endif
-	boolean	boot_completion;
-	struct wake_lock wake_lock;
-	boolean dock_state;
-	boolean boot_state;
-
-#ifndef QCT_SWITCH_STATE_CMD
-	struct switch_dev	hdmi_audio_switch;
-#endif
+	boolean is_mhl_enabled;
 };
 
 extern struct hdmi_msm_state_type *hdmi_msm_state;
@@ -150,5 +130,5 @@ void hdmi_msm_cec_msg_recv(void);
 void hdmi_msm_cec_one_touch_play(void);
 void hdmi_msm_cec_msg_send(struct hdmi_msm_cec_msg *msg);
 #endif /* CONFIG_FB_MSM_HDMI_MSM_PANEL_CEC_SUPPORT */
-
+void mhl_connect_api(boolean on);
 #endif /* __HDMI_MSM_H__ */

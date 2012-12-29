@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -17,6 +17,7 @@
 #include <linux/msm_ssbi.h>
 #include <linux/mfd/pmic8901.h>
 #include <linux/mfd/pm8xxx/core.h>
+#include <linux/module.h>
 
 /* PMIC8901 Revision */
 #define PM8901_REG_REV			0x002
@@ -37,8 +38,6 @@
 	.end	= _irq, \
 	.flags	= IORESOURCE_IRQ, \
 }
-
-extern unsigned int get_hw_rev(void);
 
 struct pm8901_chip {
 	struct pm8901_platform_data	pdata;
@@ -172,152 +171,6 @@ static struct mfd_cell mpp_cell = {
 	.resources	= mpp_cell_resources,
 	.num_resources	= ARRAY_SIZE(mpp_cell_resources),
 };
-
-
-int pm8901_preload_dVdd_old(void)
-{
-	int rc;
-	u8 reg;
-	struct pm8901_chip *pmic_chip;
-
-	if (pm8901_drvdata.pm_chip_data == NULL) {
-		pr_err("%s: Error: PMIC 8901 driver has not probed\n",
-			__func__);
-		return -ENODEV;
-	}
-
-	pmic_chip = (struct pm8901_chip *)pm8901_drvdata.pm_chip_data;
-
-	reg = 0x0F;
-	rc = msm_ssbi_write(pmic_chip->dev->parent, 0x0BD, &reg, 1);
-	if (rc)
-		pr_err("%s: ssbi_write failed for 0x0BD, rc=%d\n", __func__,
-			rc);
-
-	reg = 0xB4;
-	rc = msm_ssbi_write(pmic_chip->dev->parent, 0x001, &reg, 1);
-	if (rc)
-		pr_err("%s: ssbi_write failed for 0x001, rc=%d\n", __func__,
-			rc);
-
-	pr_info("%s: dVdd preloaded\n", __func__);
-
-	return rc;
-}
-EXPORT_SYMBOL(pm8901_preload_dVdd_old);
-
-
-int pm8901_is_old_PCB_with_PM8901(void)
-{
-        int rev;
-        unsigned char retval=0;
-
-        rev = get_hw_rev();
-        
-#if defined(CONFIG_KOR_MODEL_SHV_E110S)
-        if( rev <= 8 )
-                retval = 1;
-        else if( rev >=9 )
-                retval = 0;
-#elif defined(CONFIG_KOR_MODEL_SHV_E120S)
-        if( rev <= 10 )
-                retval = 1;
-        else if( rev >=11 )
-                retval = 0;
-
-#elif defined(CONFIG_KOR_MODEL_SHV_E120K)
-        if( rev <= 10 )
-                retval = 1;
-        else if( rev >=12 )
-                retval = 0;
-#elif defined(CONFIG_KOR_MODEL_SHV_E120L)
-        if( rev <= 6 )
-                retval = 1;
-        else if( rev >=7 )
-                retval = 0;                
-#elif defined(CONFIG_KOR_MODEL_SHV_E160S) || defined (CONFIG_JPN_MODEL_SC_05D)
-        if( rev <= 10 )
-                retval = 1;
-        else if( rev >=11 )
-                retval = 0;
-
-#elif defined(CONFIG_KOR_MODEL_SHV_E160K)
-        if( rev <= 10 )
-                retval = 1;
-        else if( rev >=11 )
-                retval = 0;
-#elif defined(CONFIG_KOR_MODEL_SHV_E160L)
-        // TODO: change condition for 160L
-        if( rev <= 9 )
-                retval = 1;
-        else if( rev >=10 )
-                retval = 0;
-#elif defined(CONFIG_EUR_MODEL_GT_I9210)
-        if( rev <= 10 )
-                retval = 1;
-        else if( rev >=11 )
-                retval = 0;
-#elif defined(CONFIG_USA_MODEL_SGH_I957)
-	if( rev <= 7 )
-		retval = 1;
-	else if( rev >= 8)
-		retval = 0;
-#elif defined(CONFIG_EUR_MODEL_GT_P7320)
-	if( rev <= 7 )
-		retval = 1;
-	else if( rev >= 8)
-		retval = 0;
-#elif defined(CONFIG_KOR_MODEL_SHV_E140S)
-	if( rev <= 7 )
-		retval = 1;
-	else if( rev >= 8)
-		retval = 0;
-#elif defined(CONFIG_KOR_MODEL_SHV_E140K)
-	if( rev <= 7 )
-		retval = 1;
-	else if( rev >= 8)
-		retval = 0;
-#elif defined(CONFIG_KOR_MODEL_SHV_E140L)
-	if( rev <= 7 )
-		retval = 1;
-	else if( rev >= 8)
-		retval = 0;
-#elif defined (CONFIG_USA_MODEL_SGH_I717)
-        if( rev <= 9 )
-                retval = 1;
-        else if( rev >=10 )
-                retval = 0;
-#elif defined (CONFIG_USA_MODEL_SGH_I757)
-        if( rev <= 7 )
-                retval = 1;
-        else if( rev >=8 )
-                retval = 0;
-#elif defined (CONFIG_USA_MODEL_SGH_T769)
-        if( rev <= 19 )
-                retval = 1;
-        else if( rev >=20 )
-                retval = 0;
-#elif defined(CONFIG_USA_MODEL_SGH_I577)
-        if( rev <= 17 )
-                retval = 1;
-        else if( rev >=18 )
-                retval = 0;
-#elif defined(CONFIG_USA_MODEL_SGH_I727)
-        if( rev <= 13 )
-                retval = 1;
-        else if( rev >=14 )
-                retval = 0;
-#elif defined(CONFIG_USA_MODEL_SGH_I727)
-        if( rev <= 14 )
-                retval = 1;
-        else if( rev >=15 )
-                retval = 0;
-#endif
-
-        return retval;
-        
-
-}
 
 static int __devinit
 pm8901_add_subdevices(const struct pm8901_platform_data *pdata,
@@ -464,17 +317,6 @@ static int __devinit pm8901_probe(struct platform_device *pdev)
 		revision_name = pm8901_rev_names[revision];
 	pr_info("%s: PMIC version: PM8901 rev %s\n", __func__, revision_name);
 
-        // This api is s/w workaround for PM8901's abnormal spike which could
-        // cause DDR problem on PCB. Because of the spike SS made new PCB for
-        // h/w workaround. This s/w workaround is for old PCBs. And If a target
-        // is new PCB,  you should call a api to drop bypass voltage
-        // to 1.725 originally. But you don't need that here, bacause you've done
-        // that already at SBL3. So instead of calling api to drop bypass voltage 
-        // here you just need to check if SBL3 bootloader includes the api.
-        // In other words this api has dependency with SBL3 change
-        if( pm8901_is_old_PCB_with_PM8901()==1 )
-                pm8901_preload_dVdd_old();
-                
 	(void) memcpy((void *)&pmic->pdata, (const void *)pdata,
 		      sizeof(pmic->pdata));
 

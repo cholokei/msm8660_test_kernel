@@ -23,6 +23,8 @@
 #include <linux/regulator/consumer.h>
 #include <linux/mm.h>
 
+#include <mach/kgsl.h>
+
 #define KGSL_NAME "kgsl"
 
 /* The number of memstore arrays limits the number of contexts allowed.
@@ -69,6 +71,23 @@
 #define KGSL_STATS_ADD(_size, _stat, _max) \
 	do { _stat += (_size); if (_stat > _max) _max = _stat; } while (0)
 
+
+#define KGSL_MEMFREE_HIST_SIZE	((int)(PAGE_SIZE * 2))
+
+struct kgsl_memfree_hist_elem {
+	unsigned int pid;
+	unsigned int gpuaddr;
+	unsigned int size;
+	unsigned int flags;
+};
+
+struct kgsl_memfree_hist {
+	void *base_hist_rb;
+	unsigned int size;
+	struct kgsl_memfree_hist_elem *wptr;
+};
+
+
 struct kgsl_device;
 
 struct kgsl_driver {
@@ -96,6 +115,9 @@ struct kgsl_driver {
 
 	void *ptpool;
 
+	struct mutex memfree_hist_mutex;
+	struct kgsl_memfree_hist memfree_hist;
+
 	struct {
 		unsigned int vmalloc;
 		unsigned int vmalloc_max;
@@ -122,20 +144,25 @@ struct kgsl_memdesc_ops {
 	int (*map_kernel_mem)(struct kgsl_memdesc *);
 };
 
+/* Internal definitions for memdesc->priv */
 #define KGSL_MEMDESC_GUARD_PAGE BIT(0)
+/* Set if the memdesc is mapped into all pagetables */
+#define KGSL_MEMDESC_GLOBAL BIT(1)
 
 /* shared memory allocation */
 struct kgsl_memdesc {
 	struct kgsl_pagetable *pagetable;
-	void *hostptr;
+	void *hostptr; /* kernel virtual address */
+	unsigned long useraddr; /* userspace address */
 	unsigned int gpuaddr;
 	unsigned int physaddr;
 	unsigned int size;
-	unsigned int priv;
+	unsigned int priv; /* Internal flags and settings */
 	struct scatterlist *sg;
-	unsigned int sglen;
+	unsigned int sglen; /* Active entries in the sglist */
+	unsigned int sglen_alloc;  /* Allocated entries in the sglist */
 	struct kgsl_memdesc_ops *ops;
-	int flags;
+	unsigned int flags; /* Flags set from userspace */
 };
 
 /* List of different memory entry types */
@@ -158,6 +185,7 @@ struct kgsl_mem_entry {
 	int flags;
 	void *priv_data;
 	struct rb_node node;
+	unsigned int id;
 	unsigned int context_id;
 	/* back pointer to private structure under whose context this
 	* allocation is made */
@@ -171,13 +199,16 @@ struct kgsl_mem_entry {
 #endif
 
 void kgsl_mem_entry_destroy(struct kref *kref);
+int kgsl_postmortem_dump(struct kgsl_device *device, int manual);
 
-struct kgsl_mem_entry *kgsl_get_mem_entry(unsigned int ptbase,
-		unsigned int gpuaddr, unsigned int size);
+struct kgsl_mem_entry *kgsl_get_mem_entry(struct kgsl_device *device,
+		unsigned int ptbase, unsigned int gpuaddr, unsigned int size);
 
 struct kgsl_mem_entry *kgsl_sharedmem_find_region(
 	struct kgsl_process_private *private, unsigned int gpuaddr,
 	size_t size);
+
+void kgsl_get_memory_usage(char *str, size_t len, unsigned int memflags);
 
 int kgsl_add_event(struct kgsl_device *device, u32 id, u32 ts,
 	void (*cb)(struct kgsl_device *, void *, u32, u32), void *priv,
@@ -211,6 +242,10 @@ static inline void kgsl_drm_exit(void)
 static inline int kgsl_gpuaddr_in_memdesc(const struct kgsl_memdesc *memdesc,
 				unsigned int gpuaddr, unsigned int size)
 {
+	/* don't overflow */
+	if ((gpuaddr + size) < gpuaddr)
+		return 0;
+
 	if (gpuaddr >= memdesc->gpuaddr &&
 	    ((gpuaddr + size) <= (memdesc->gpuaddr + memdesc->size))) {
 		return 1;

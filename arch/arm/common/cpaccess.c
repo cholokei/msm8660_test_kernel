@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -62,6 +62,8 @@ static DEFINE_PER_CPU(struct cp_params, cp_param)
 static struct sysdev_class cpaccess_sysclass = {
 	.name = "cpaccess",
 };
+
+void cpaccess_dummy_inst(void);
 
 #ifdef CONFIG_ARCH_MSM_KRAIT
 /*
@@ -143,9 +145,13 @@ static void do_il2_rw(char *str_tmp)
  */
 static noinline unsigned long cpaccess_dummy(unsigned long write_val)
 {
-	asm("mrc p15, 0, r0, c0, c0, 0\n\t");
-	asm("bx	lr\n\t");
-	return 0xBEEF;
+	unsigned long ret = 0xBEEF;
+
+	asm volatile (".globl cpaccess_dummy_inst\n"
+			"cpaccess_dummy_inst:\n\t"
+			"mrc p15, 0, %0, c0, c0, 0\n\t" : "=r" (ret) :
+				"r" (write_val));
+	return ret;
 } __attribute__((aligned(32)))
 
 /*
@@ -195,7 +201,7 @@ static unsigned long do_cpregister_rw(int write)
 	 * Grab address of the Dummy function, write the MRC/MCR
 	 * instruction, ensuring cache coherency.
 	 */
-	p_opcode = (unsigned long *)&cpaccess_dummy;
+	p_opcode = (unsigned long *)&cpaccess_dummy_inst;
 	mem_text_write_kernel_word(p_opcode, opcode);
 
 #ifdef CONFIG_SMP
@@ -318,30 +324,24 @@ static struct sys_device device_cpaccess = {
  */
 static int __init init_cpaccess_sysfs(void)
 {
-	int error;
+	int error = sysdev_class_register(&cpaccess_sysclass);
 
-	error = sysdev_class_register(&cpaccess_sysclass);
-	if (error)
-		goto err ;
+	if (!error)
+		error = sysdev_register(&device_cpaccess);
+	else
+		pr_err("Error initializing cpaccess interface\n");
 
-	error = sysdev_register(&device_cpaccess);
-	if (error)
-		goto err_class_unregister ;
-
-	error = sysdev_create_file(&device_cpaccess, &attr_cp_rw);
-	if (error)
-		goto err_unregister ;
+	if (!error)
+		error = sysdev_create_file(&device_cpaccess,
+		 &attr_cp_rw);
+	else {
+		pr_err("Error initializing cpaccess interface\n");
+		sysdev_unregister(&device_cpaccess);
+		sysdev_class_unregister(&cpaccess_sysclass);
+	}
 
 	sema_init(&cp_sem, 1);
 
-	return error;
-
-err_unregister:
-	sysdev_unregister(&device_cpaccess);
-err_class_unregister:
-	sysdev_class_unregister(&cpaccess_sysclass);
-err:
-	pr_err("Error initializing cpaccess interface\n");
 	return error;
 }
 

@@ -14,8 +14,7 @@
 #define __KGSL_DEVICE_H
 
 #include <linux/idr.h>
-#include <linux/wakelock.h>
-#include <linux/pm_qos_params.h>
+#include <linux/pm_qos.h>
 #include <linux/earlysuspend.h>
 
 #include "kgsl.h"
@@ -23,6 +22,7 @@
 #include "kgsl_pwrctrl.h"
 #include "kgsl_log.h"
 #include "kgsl_pwrscale.h"
+#include <linux/sync.h>
 
 #define KGSL_TIMEOUT_NONE       0
 #define KGSL_TIMEOUT_DEFAULT    0xFFFFFFFF
@@ -58,6 +58,7 @@ struct platform_device;
 struct kgsl_device_private;
 struct kgsl_context;
 struct kgsl_power_stats;
+struct kgsl_event;
 
 struct kgsl_functable {
 	/* Mandatory functions - these functions must be implemented
@@ -68,7 +69,7 @@ struct kgsl_functable {
 		unsigned int offsetwords, unsigned int *value);
 	void (*regwrite) (struct kgsl_device *device,
 		unsigned int offsetwords, unsigned int value);
-	int (*idle) (struct kgsl_device *device, unsigned int timeout);
+	int (*idle) (struct kgsl_device *device);
 	unsigned int (*isidle) (struct kgsl_device *device);
 	int (*suspend_context) (struct kgsl_device *device);
 	int (*start) (struct kgsl_device *device, unsigned int init_ram);
@@ -111,6 +112,9 @@ struct kgsl_functable {
 	int (*setproperty) (struct kgsl_device *device,
 		enum kgsl_property_type type, void *value,
 		unsigned int sizebytes);
+	int (*postmortem_dump) (struct kgsl_device *device, int manual);
+	void (*next_event)(struct kgsl_device *device,
+		struct kgsl_event *event);
 };
 
 /* MH register values */
@@ -139,11 +143,27 @@ struct kgsl_device {
 	unsigned int ver_minor;
 	uint32_t flags;
 	enum kgsl_deviceid id;
+
+	/* Starting physical address for GPU registers */
 	unsigned long reg_phys;
+
+	/* Starting Kernel virtual address for GPU registers */
 	void *reg_virt;
+
+	/* Total memory size for all GPU registers */
 	unsigned int reg_len;
+
+	/* Kernel virtual address for GPU shader memory */
+	void *shader_mem_virt;
+
+	/* Starting physical address for GPU shader memory */
+	unsigned long shader_mem_phys;
+
+	/* GPU shader memory size */
+	unsigned int shader_mem_len;
 	struct kgsl_memdesc memstore;
 	const char *iomemname;
+	const char *shadermemname;
 
 	struct kgsl_mh mh;
 	struct kgsl_mmu mmu;
@@ -154,12 +174,10 @@ struct kgsl_device {
 	struct kgsl_pwrctrl pwrctrl;
 	int open_count;
 
-	struct atomic_notifier_head ts_notifier_list;
 	struct mutex mutex;
 	uint32_t state;
 	uint32_t requested_state;
 
-	unsigned int last_expired_ctxt_id;
 	unsigned int active_cnt;
 	struct completion suspend_gate;
 
@@ -192,13 +210,16 @@ struct kgsl_device {
 	int drv_log;
 	int mem_log;
 	int pwr_log;
-	struct wake_lock idle_wakelock;
 	struct kgsl_pwrscale pwrscale;
 	struct kobject pwrscale_kobj;
-	struct pm_qos_request_list pm_qos_req_dma;
+	struct pm_qos_request pm_qos_req_dma;
 	struct work_struct ts_expired_ws;
 	struct list_head events;
 	s64 on_time;
+
+	/* Postmortem Control switches */
+	int pm_regs_enabled;
+	int pm_ib_enabled;
 };
 
 void kgsl_timestamp_expired(struct work_struct *work);
@@ -207,7 +228,6 @@ void kgsl_timestamp_expired(struct work_struct *work);
 	.hwaccess_gate = COMPLETION_INITIALIZER((_dev).hwaccess_gate),\
 	.suspend_gate = COMPLETION_INITIALIZER((_dev).suspend_gate),\
 	.recovery_gate = COMPLETION_INITIALIZER((_dev).recovery_gate),\
-	.ts_notifier_list = ATOMIC_NOTIFIER_INIT((_dev).ts_notifier_list),\
 	.idle_check_ws = __WORK_INITIALIZER((_dev).idle_check_ws,\
 			kgsl_idle_check),\
 	.ts_expired_ws  = __WORK_INITIALIZER((_dev).ts_expired_ws,\
@@ -218,8 +238,7 @@ void kgsl_timestamp_expired(struct work_struct *work);
 	.mutex = __MUTEX_INITIALIZER((_dev).mutex),\
 	.state = KGSL_STATE_INIT,\
 	.ver_major = DRIVER_VERSION_MAJOR,\
-	.ver_minor = DRIVER_VERSION_MINOR,\
-	.last_expired_ctxt_id = KGSL_CONTEXT_INVALID
+	.ver_minor = DRIVER_VERSION_MINOR
 
 struct kgsl_context {
 	struct kref refcount;
@@ -235,6 +254,13 @@ struct kgsl_context {
 	 * context was responsible for causing it
 	 */
 	unsigned int reset_status;
+	/* Flag indicating if we tried to wait for bad timestamp for this ctx */
+	bool wait_on_invalid_ts;
+	/*
+	 * Timeline used to create fences that can be signaled when a
+	 * sync_pt timestamp expires.
+	 */
+	struct sync_timeline *timeline;
 };
 
 struct kgsl_process_private {
@@ -242,9 +268,11 @@ struct kgsl_process_private {
 	pid_t pid;
 	spinlock_t mem_lock;
 	struct rb_root mem_rb;
+	struct idr mem_idr;
 	struct kgsl_pagetable *pagetable;
 	struct list_head list;
 	struct kobject kobj;
+	struct dentry *debug_root;
 
 	struct {
 		unsigned int cur;
@@ -286,9 +314,9 @@ static inline void kgsl_regwrite(struct kgsl_device *device,
 	device->ftbl->regwrite(device, offsetwords, value);
 }
 
-static inline int kgsl_idle(struct kgsl_device *device, unsigned int timeout)
+static inline int kgsl_idle(struct kgsl_device *device)
 {
-	return device->ftbl->idle(device, timeout);
+	return device->ftbl->idle(device);
 }
 
 static inline unsigned int kgsl_gpuid(struct kgsl_device *device,
@@ -365,12 +393,6 @@ kgsl_find_context(struct kgsl_device_private *dev_priv, uint32_t id)
 
 int kgsl_check_timestamp(struct kgsl_device *device,
 		struct kgsl_context *context, unsigned int timestamp);
-
-int kgsl_register_ts_notifier(struct kgsl_device *device,
-			      struct notifier_block *nb);
-
-int kgsl_unregister_ts_notifier(struct kgsl_device *device,
-				struct notifier_block *nb);
 
 int kgsl_device_platform_probe(struct kgsl_device *device);
 

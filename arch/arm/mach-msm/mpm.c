@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -20,12 +20,13 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/irq.h>
-#include <asm/hardware/gic.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <asm/hardware/gic.h>
 #include <mach/msm_iomap.h>
 #include <mach/gpio.h>
 
-#include "mpm.h"
+#include <mach/mpm.h>
 
 /******************************************************************************
  * Debug Definitions
@@ -68,6 +69,7 @@ enum {
 #define MSM_MPM_IRQ_INDEX(irq)  (irq / 32)
 #define MSM_MPM_IRQ_MASK(irq)  BIT(irq % 32)
 
+static struct msm_mpm_device_data msm_mpm_dev_data;
 static uint8_t msm_mpm_irqs_a2m[MSM_MPM_NR_APPS_IRQS];
 
 static DEFINE_SPINLOCK(msm_mpm_lock);
@@ -326,7 +328,7 @@ static int msm_mpm_set_irq_type(struct irq_data *d, unsigned int flow_type)
 /******************************************************************************
  * Public functions
  *****************************************************************************/
-int msm_mpm_enable_pin(enum msm_mpm_pin pin, unsigned int enable)
+int msm_mpm_enable_pin(unsigned int pin, unsigned int enable)
 {
 	uint32_t index = MSM_MPM_IRQ_INDEX(pin);
 	uint32_t mask = MSM_MPM_IRQ_MASK(pin);
@@ -343,7 +345,7 @@ int msm_mpm_enable_pin(enum msm_mpm_pin pin, unsigned int enable)
 	return 0;
 }
 
-int msm_mpm_set_pin_wake(enum msm_mpm_pin pin, unsigned int on)
+int msm_mpm_set_pin_wake(unsigned int pin, unsigned int on)
 {
 	uint32_t index = MSM_MPM_IRQ_INDEX(pin);
 	uint32_t mask = MSM_MPM_IRQ_MASK(pin);
@@ -360,7 +362,7 @@ int msm_mpm_set_pin_wake(enum msm_mpm_pin pin, unsigned int on)
 	return 0;
 }
 
-int msm_mpm_set_pin_type(enum msm_mpm_pin pin, unsigned int flow_type)
+int msm_mpm_set_pin_type(unsigned int pin, unsigned int flow_type)
 {
 	uint32_t index = MSM_MPM_IRQ_INDEX(pin);
 	uint32_t mask = MSM_MPM_IRQ_MASK(pin);
@@ -386,6 +388,7 @@ bool msm_mpm_irqs_detectable(bool from_idle)
 {
 	unsigned long *apps_irq_bitmap;
 	int debug_mask;
+	int i = 0;
 
 	if (from_idle) {
 		apps_irq_bitmap = msm_mpm_enabled_apps_irqs;
@@ -398,15 +401,17 @@ bool msm_mpm_irqs_detectable(bool from_idle)
 	}
 
 	if (debug_mask) {
-		static char buf[DIV_ROUND_UP(MSM_MPM_NR_APPS_IRQS, 32)*9+1];
+		i = find_first_bit(apps_irq_bitmap, MSM_MPM_NR_APPS_IRQS);
+		while (i < MSM_MPM_NR_APPS_IRQS) {
+			struct irq_desc *desc = i ?
+				irq_to_desc(i) : NULL;
+			pr_info("%s: cannot monitor irq=%d %s\n",
+			__func__, i, desc->name);
+			i = find_next_bit(apps_irq_bitmap,
+				MSM_MPM_NR_APPS_IRQS, i + 1);
+		}
 
-		bitmap_scnprintf(buf, sizeof(buf), apps_irq_bitmap,
-				MSM_MPM_NR_APPS_IRQS);
-		buf[sizeof(buf) - 1] = '\0';
-
-		pr_info("%s: cannot monitor %s", __func__, buf);
 	}
-
 	return (bool)__bitmap_empty(apps_irq_bitmap, MSM_MPM_NR_APPS_IRQS);
 }
 
@@ -419,7 +424,7 @@ bool msm_mpm_gpio_irqs_detectable(bool from_idle)
 			MSM_MPM_NR_APPS_IRQS);
 }
 
-void msm_mpm_enter_sleep(bool from_idle)
+void msm_mpm_enter_sleep(uint32_t sclk_count, bool from_idle)
 {
 	msm_mpm_set(!from_idle);
 }
@@ -472,7 +477,7 @@ static int __init msm_mpm_early_init(void)
 }
 core_initcall(msm_mpm_early_init);
 
-void msm_mpm_irq_extn_init(void)
+void __init msm_mpm_irq_extn_init(struct msm_mpm_device_data *mpm_data)
 {
 	gic_arch_extn.irq_mask = msm_mpm_disable_irq;
 	gic_arch_extn.irq_unmask = msm_mpm_enable_irq;
@@ -487,6 +492,29 @@ void msm_mpm_irq_extn_init(void)
 	msm_gpio_irq_extn.irq_set_wake = msm_mpm_set_irq_wake;
 
 	bitmap_set(msm_mpm_gpio_irqs_mask, NR_MSM_IRQS, NR_GPIO_IRQS);
+
+	if (!mpm_data) {
+#ifdef CONFIG_MSM_MPM
+		BUG();
+#endif
+		return;
+	}
+
+	memcpy(&msm_mpm_dev_data, mpm_data, sizeof(struct msm_mpm_device_data));
+
+	msm_mpm_dev_data.irqs_m2a =
+		kzalloc(msm_mpm_dev_data.irqs_m2a_size * sizeof(uint16_t),
+			GFP_KERNEL);
+	BUG_ON(!msm_mpm_dev_data.irqs_m2a);
+	memcpy(msm_mpm_dev_data.irqs_m2a, mpm_data->irqs_m2a,
+		msm_mpm_dev_data.irqs_m2a_size * sizeof(uint16_t));
+	msm_mpm_dev_data.bypassed_apps_irqs =
+		kzalloc(msm_mpm_dev_data.bypassed_apps_irqs_size *
+			sizeof(uint16_t), GFP_KERNEL);
+	BUG_ON(!msm_mpm_dev_data.bypassed_apps_irqs);
+	memcpy(msm_mpm_dev_data.bypassed_apps_irqs,
+		mpm_data->bypassed_apps_irqs,
+		msm_mpm_dev_data.bypassed_apps_irqs_size * sizeof(uint16_t));
 }
 
 static int __init msm_mpm_init(void)

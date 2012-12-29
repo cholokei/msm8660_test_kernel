@@ -1,3 +1,31 @@
+* Qualcomm MSM UART
+
+Required properties:
+- compatible :
+	- "qcom,msm-uart", and one of "qcom,msm-hsuart" or
+	  "qcom,msm-lsuart".
+- reg : offset and length of the register set for the device
+	for the hsuart operating in compatible mode, there should be a
+	second pair describing the gsbi registers.
+- interrupts : should contain the uart interrupt.
+
+There are two different UART blocks used in MSM devices,
+"qcom,msm-hsuart" and "qcom,msm-lsuart".  The msm-serial driver is
+able to handle both of these, and matches against the "qcom,msm-uart"
+as the compatibility.
+
+The registers for the "qcom,msm-hsuart" device need to specify both
+register blocks, even for the common driver.
+
+Example:
+
+	uart@19c400000 {
+		compatible = "qcom,msm-hsuart", "qcom,msm-uart";
+		reg = <0x19c40000 0x1000>,
+		      <0x19c00000 0x1000>;
+		interrupts = <195>;
+	};
+
 * Qualcomm MSM HSUART
 
 Required properties:
@@ -6,9 +34,19 @@ Required properties:
 - reg : offset and length of the register set for the device.
 - interrupts : should contain the uart interrupt.
 
-Example:
+Aliases:
+An alias may optionally be used to bind the serial device to a tty device
+(ttyHSLx) with a given line number. Aliases are of the form serial<n> where <n>
+is an integer representing the line number to use. On systems with multiple
+serial devices present it is recommended that an alias be defined for each such
+device.
 
-	serial@19c400000 {
+Example:
+	aliases {
+		serial0 = &uart0;       // This device will be called ttyHSL0
+	};
+
+	uart0: serial@19c400000 {
 		compatible = "qcom,msm-lsuart-v14"
 		reg = <0x19c40000 0x1000">;
 		interrupts = <195>;

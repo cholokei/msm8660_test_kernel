@@ -4,9 +4,9 @@
 
 #include <linux/time.h>
 #include <linux/fs.h>
-#include <linux/reiserfs_fs.h>
-#include <linux/reiserfs_acl.h>
-#include <linux/reiserfs_xattr.h>
+#include "reiserfs.h"
+#include "acl.h"
+#include "xattr.h"
 #include <linux/exportfs.h>
 #include <linux/pagemap.h>
 #include <linux/highmem.h>
@@ -1154,7 +1154,7 @@ static void init_inode(struct inode *inode, struct treepath *path)
 		set_inode_item_key_version(inode, KEY_FORMAT_3_5);
 		set_inode_sd_version(inode, STAT_DATA_V1);
 		inode->i_mode = sd_v1_mode(sd);
-		inode->i_nlink = sd_v1_nlink(sd);
+		set_nlink(inode, sd_v1_nlink(sd));
 		inode->i_uid = sd_v1_uid(sd);
 		inode->i_gid = sd_v1_gid(sd);
 		inode->i_size = sd_v1_size(sd);
@@ -1199,7 +1199,7 @@ static void init_inode(struct inode *inode, struct treepath *path)
 		struct stat_data *sd = (struct stat_data *)B_I_PITEM(bh, ih);
 
 		inode->i_mode = sd_v2_mode(sd);
-		inode->i_nlink = sd_v2_nlink(sd);
+		set_nlink(inode, sd_v2_nlink(sd));
 		inode->i_uid = sd_v2_uid(sd);
 		inode->i_size = sd_v2_size(sd);
 		inode->i_gid = sd_v2_gid(sd);
@@ -1444,7 +1444,7 @@ void reiserfs_read_locked_inode(struct inode *inode,
 		/* a stale NFS handle can trigger this without it being an error */
 		pathrelse(&path_to_sd);
 		reiserfs_make_bad_inode(inode);
-		inode->i_nlink = 0;
+		clear_nlink(inode);
 		return;
 	}
 
@@ -1475,6 +1475,11 @@ void reiserfs_read_locked_inode(struct inode *inode,
 
 	reiserfs_check_path(&path_to_sd);	/* init inode should be relsing */
 
+	/*
+	 * Stat data v1 doesn't support ACLs.
+	 */
+	if (get_inode_sd_version(inode) == STAT_DATA_V1)
+		cache_no_acl(inode);
 }
 
 /**
@@ -1568,10 +1573,8 @@ struct dentry *reiserfs_fh_to_dentry(struct super_block *sb, struct fid *fid,
 			reiserfs_warning(sb, "reiserfs-13077",
 				"nfsd/reiserfs, fhtype=%d, len=%d - odd",
 				fh_type, fh_len);
-		fh_type = fh_len;
+		fh_type = 5;
 	}
-	if (fh_len < 2)
-		return NULL;
 
 	return reiserfs_get_dentry(sb, fid->raw[0], fid->raw[1],
 		(fh_type == 3 || fh_type >= 5) ? fid->raw[2] : 0);
@@ -1580,8 +1583,6 @@ struct dentry *reiserfs_fh_to_dentry(struct super_block *sb, struct fid *fid,
 struct dentry *reiserfs_fh_to_parent(struct super_block *sb, struct fid *fid,
 		int fh_len, int fh_type)
 {
-	if (fh_type > fh_len)
-		fh_type = fh_len;
 	if (fh_type < 4)
 		return NULL;
 
@@ -1765,7 +1766,7 @@ static int reiserfs_new_symlink(struct reiserfs_transaction_handle *th, struct i
    for the fresh inode.  This can only be done outside a transaction, so
    if we return non-zero, we also end the transaction.  */
 int reiserfs_new_inode(struct reiserfs_transaction_handle *th,
-		       struct inode *dir, int mode, const char *symname,
+		       struct inode *dir, umode_t mode, const char *symname,
 		       /* 0 for regular, EMTRY_DIR_SIZE for dirs,
 		          strlen (symname) for symlinks) */
 		       loff_t i_size, struct dentry *dentry,
@@ -1831,7 +1832,7 @@ int reiserfs_new_inode(struct reiserfs_transaction_handle *th,
 #endif
 
 	/* fill stat data */
-	inode->i_nlink = (S_ISDIR(mode) ? 2 : 1);
+	set_nlink(inode, (S_ISDIR(mode) ? 2 : 1));
 
 	/* uid and gid must already be set by the caller for quota init */
 
@@ -1986,7 +1987,7 @@ int reiserfs_new_inode(struct reiserfs_transaction_handle *th,
 	make_bad_inode(inode);
 
       out_inserted_sd:
-	inode->i_nlink = 0;
+	clear_nlink(inode);
 	th->t_trans_id = 0;	/* so the caller can't use this handle later */
 	unlock_new_inode(inode); /* OK to do even if we hadn't locked it */
 	iput(inode);
@@ -3072,9 +3073,8 @@ static ssize_t reiserfs_direct_IO(int rw, struct kiocb *iocb,
 	struct inode *inode = file->f_mapping->host;
 	ssize_t ret;
 
-	ret = blockdev_direct_IO(rw, iocb, inode, inode->i_sb->s_bdev, iov,
-				  offset, nr_segs,
-				  reiserfs_get_blocks_direct_io, NULL);
+	ret = blockdev_direct_IO(rw, iocb, inode, iov, offset, nr_segs,
+				  reiserfs_get_blocks_direct_io);
 
 	/*
 	 * In case of error extending write may have instantiated a few
@@ -3118,6 +3118,9 @@ int reiserfs_setattr(struct dentry *dentry, struct iattr *attr)
 			error = -EFBIG;
 			goto out;
 		}
+
+		inode_dio_wait(inode);
+
 		/* fill in hole pointers in the expanding truncate case. */
 		if (attr->ia_size > inode->i_size) {
 			error = generic_cont_expand_simple(inode, attr->ia_size);

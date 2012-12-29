@@ -84,6 +84,8 @@
 
 #define DDL_MAX_NUM_IN_INPUTFRAME_POOL          (DDL_MAX_NUM_OF_B_FRAME + 1)
 
+#define MDP_MIN_TILE_HEIGHT			96
+
 enum ddl_mem_area {
 	DDL_FW_MEM	= 0x0,
 	DDL_MM_MEM	= 0x1,
@@ -169,6 +171,7 @@ struct ddl_dec_buffer_size{
 	u32  sz_desc;
 	u32  sz_cpb;
 	u32  sz_context;
+	u32  sz_extnuserdata;
 };
 struct ddl_dec_buffers{
 	struct ddl_buf_addr desc;
@@ -184,6 +187,7 @@ struct ddl_dec_buffers{
 	struct ddl_buf_addr h264_vert_nb_mv;
 	struct ddl_buf_addr h264_nb_ip;
 	struct ddl_buf_addr context;
+	struct ddl_buf_addr extnuserdata;
 };
 struct ddl_enc_buffer_size{
 	u32  sz_cur_y;
@@ -227,6 +231,17 @@ struct ddl_batch_frame_data {
 	u32 num_output_frames;
 	u32 out_frm_next_frmindex;
 };
+struct ddl_mp2_datadumpenabletype {
+	u32 userdatadump_enable;
+	u32 pictempscalable_extdump_enable;
+	u32 picspat_extdump_enable;
+	u32 picdisp_extdump_enable;
+	u32 copyright_extdump_enable;
+	u32 quantmatrix_extdump_enable;
+	u32 seqscalable_extdump_enable;
+	u32 seqdisp_extdump_enable;
+	u32 seq_extdump_enable;
+};
 struct ddl_encoder_data{
 	struct ddl_codec_data_hdr   hdr;
 	struct vcd_property_codec   codec;
@@ -260,6 +275,7 @@ struct ddl_encoder_data{
 	struct ddl_enc_buffers  hw_bufs;
 	struct ddl_yuv_buffer_size  input_buf_size;
 	struct vidc_1080p_enc_frame_info enc_frame_info;
+	u32  plusptype_enable;
 	u32  meta_data_enable_flag;
 	u32  suffix;
 	u32  meta_data_offset;
@@ -274,8 +290,11 @@ struct ddl_encoder_data{
 	u32  ext_enc_control_val;
 	u32  num_references_for_p_frame;
 	u32  closed_gop;
+	u32  num_slices_comp;
 	struct vcd_property_slice_delivery_info slice_delivery_info;
 	struct ddl_batch_frame_data batch_frame;
+	u32 avc_delimiter_enable;
+	u32 vui_timinginfo_enable;
 };
 struct ddl_decoder_data {
 	struct ddl_codec_data_hdr  hdr;
@@ -307,6 +326,7 @@ struct ddl_decoder_data {
 	u32  header_in_start;
 	u32  min_dpb_num;
 	u32  y_cb_cr_size;
+	u32  yuv_size;
 	u32  dynamic_prop_change;
 	u32  dynmic_prop_change_req;
 	u32  flush_pending;
@@ -317,6 +337,11 @@ struct ddl_decoder_data {
 	u32  cont_mode;
 	u32  reconfig_detected;
 	u32  dmx_disable;
+	int avg_dec_time;
+	int dec_time_sum;
+	struct ddl_mp2_datadumpenabletype mp2_datadump_enable;
+	u32 mp2_datadump_status;
+	u32 extn_user_data_enable;
 };
 union ddl_codec_data{
 	struct ddl_codec_data_hdr  hdr;
@@ -481,4 +506,8 @@ u32 ddl_fw_init(struct ddl_buf_addr *dram_base);
 void ddl_get_fw_info(const unsigned char **fw_array_addr,
 	unsigned int *fw_size);
 void ddl_fw_release(struct ddl_buf_addr *);
+int ddl_vidc_decode_get_avg_time(struct ddl_client_context *ddl);
+void ddl_vidc_decode_reset_avg_time(struct ddl_client_context *ddl);
+void ddl_calc_core_proc_time(const char *func_name, u32 index,
+		struct ddl_client_context *ddl);
 #endif

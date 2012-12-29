@@ -20,6 +20,7 @@
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MAP_TABLE_SZ 64
 #define VCD_ENC_MAX_OUTBFRS_PER_FRAME 8
+#define MAX_DEC_TIME 33
 
 struct vcd_msm_map_buffer {
 	phys_addr_t phy_addr;
@@ -91,8 +92,8 @@ static int vcd_pmem_alloc(size_t sz, u8 **kernel_vaddr, u8 **phy_addr,
 	} else {
 		map_buffer->alloc_handle = ion_alloc(
 			    cctxt->vcd_ion_client, sz, SZ_4K,
-			    memtype);
-		if (!map_buffer->alloc_handle) {
+			    memtype, res_trk_get_ion_flags());
+		if (IS_ERR_OR_NULL(map_buffer->alloc_handle)) {
 			pr_err("%s() ION alloc failed", __func__);
 			goto bailout;
 		}
@@ -104,8 +105,7 @@ static int vcd_pmem_alloc(size_t sz, u8 **kernel_vaddr, u8 **phy_addr,
 		}
 		*kernel_vaddr = (u8 *) ion_map_kernel(
 				cctxt->vcd_ion_client,
-				map_buffer->alloc_handle,
-				ionflag);
+				map_buffer->alloc_handle);
 		if (!(*kernel_vaddr)) {
 			pr_err("%s() ION map failed", __func__);
 			goto ion_free_bailout;
@@ -119,9 +119,11 @@ static int vcd_pmem_alloc(size_t sz, u8 **kernel_vaddr, u8 **phy_addr,
 				0,
 				(unsigned long *)&iova,
 				(unsigned long *)&buffer_size,
-				UNCACHED, 0);
-			if (ret) {
-				pr_err("%s() ION iommu map failed", __func__);
+				0, 0);
+			if (ret || !iova) {
+				pr_err(
+				"%s() ION iommu map failed, ret = %d, iova = 0x%lx",
+					__func__, ret, iova);
 				goto ion_map_bailout;
 			}
 			map_buffer->phy_addr = iova;
@@ -782,7 +784,11 @@ u32 vcd_free_one_buffer_internal(
 		buf_pool->allocated--;
 	}
 
-	memset(buf_entry, 0, sizeof(struct vcd_buffer_entry));
+	buf_entry->valid = buf_entry->allocated = buf_entry->in_use = 0;
+	buf_entry->alloc = buf_entry->virtual = buf_entry->physical = NULL;
+	buf_entry->sz = 0;
+	memset(&buf_entry->frame, 0, sizeof(struct vcd_frame_data));
+
 	buf_pool->validated--;
 	if (buf_pool->validated == 0)
 		vcd_free_buffer_pool_entries(buf_pool);
@@ -918,7 +924,7 @@ struct vcd_buffer_entry *vcd_find_buffer_pool_entry
 	u32 i;
 	u32 found = false;
 
-	for (i = 0; i <= pool->count && !found; i++) {
+	for (i = 1; i <= pool->count && !found; i++) {
 		if (pool->entries[i].virtual == addr)
 			found = true;
 
@@ -1252,7 +1258,7 @@ u32 vcd_validate_driver_handle(
 	driver_handle--;
 
 	if (driver_handle < 0 ||
-		driver_handle >= VCD_DRIVER_INSTANCE_MAX ||
+		driver_handle >= VCD_DRIVER_CLIENTS_MAX ||
 		!dev_ctxt->driver_ids[driver_handle]) {
 		return false;
 	} else {
@@ -1530,6 +1536,8 @@ u32 vcd_submit_frame(struct vcd_dev_ctxt *dev_ctxt,
 	struct vcd_buffer_entry *op_buf_entry = NULL;
 	u32 rc = VCD_S_SUCCESS;
 	u32 evcode = 0;
+	u32 perf_level = 0;
+	int decodeTime = 0;
 	struct ddl_frame_data_tag ddl_ip_frm;
 	struct ddl_frame_data_tag *ddl_op_frm;
 	u32 out_buf_cnt = 0;
@@ -1545,6 +1553,16 @@ u32 vcd_submit_frame(struct vcd_dev_ctxt *dev_ctxt,
 	ip_frm_entry->ip_frm_tag = (u32) transc;
 	memset(&ddl_ip_frm, 0, sizeof(ddl_ip_frm));
 	if (cctxt->decoding) {
+		decodeTime = ddl_get_core_decode_proc_time(cctxt->ddl_handle);
+		if (decodeTime > MAX_DEC_TIME) {
+			if (res_trk_get_curr_perf_level(&perf_level)) {
+				vcd_update_decoder_perf_level(dev_ctxt,
+				   res_trk_estimate_perf_level(perf_level));
+				ddl_reset_avg_dec_time(cctxt->ddl_handle);
+			} else
+				VCD_MSG_ERROR("%s(): retrieve curr_perf_level"
+						"returned FALSE\n", __func__);
+		}
 		evcode = CLIENT_STATE_EVENT_NUMBER(decode_frame);
 		ddl_ip_frm.vcd_frm = *ip_frm_entry;
 		rc = ddl_decode_frame(cctxt->ddl_handle, &ddl_ip_frm,
@@ -1666,7 +1684,7 @@ u32 vcd_process_cmd_sess_start(struct vcd_clnt_ctxt *cctxt)
 void vcd_send_frame_done_in_eos(struct vcd_clnt_ctxt *cctxt,
 	 struct vcd_frame_data *input_frame, u32 valid_opbuf)
 {
-	VCD_MSG_LOW("vcd_send_frame_done_in_eos:");
+	VCD_MSG_HIGH("vcd_send_frame_done_in_eos:");
 
 	if (!input_frame->virtual && !valid_opbuf) {
 		VCD_MSG_MED("Sending NULL output with EOS");
@@ -1786,12 +1804,41 @@ void vcd_send_frame_done_in_eos_for_enc(
 	}
 }
 
+struct vcd_transc *vcd_get_first_in_use_trans_for_clnt(
+	struct vcd_clnt_ctxt *cctxt)
+{
+	u32 i;
+	struct vcd_dev_ctxt *dev_ctxt;
+	VCD_MSG_HIGH("%s: ", __func__);
+	dev_ctxt = cctxt->dev_ctxt;
+	if (!dev_ctxt->trans_tbl) {
+		VCD_MSG_ERROR("%s: Null trans_tbl", __func__);
+		return NULL;
+	}
+	i = 0;
+	while (i < dev_ctxt->trans_tbl_size) {
+		if ((cctxt == dev_ctxt->trans_tbl[i].cctxt) &&
+			(dev_ctxt->trans_tbl[i].in_use)) {
+			VCD_MSG_MED("%s: found transc = 0x%p",
+				__func__, &dev_ctxt->trans_tbl[i]);
+			break;
+		}
+		i++;
+	}
+	if (i == dev_ctxt->trans_tbl_size) {
+		VCD_MSG_ERROR("%s: in_use transction not found",
+			__func__);
+		return NULL;
+	} else
+		return &dev_ctxt->trans_tbl[i];
+}
+
 u32 vcd_handle_recvd_eos(
 	struct vcd_clnt_ctxt *cctxt,
 	 struct vcd_frame_data *input_frame, u32 *pb_eos_handled)
 {
 	u32 rc;
-
+	struct vcd_transc *transc;
 	VCD_MSG_LOW("vcd_handle_recvd_eos:");
 
 	*pb_eos_handled = false;
@@ -1809,13 +1856,21 @@ u32 vcd_handle_recvd_eos(
 		*pb_eos_handled = true;
 	else if (cctxt->decoding && !input_frame->virtual)
 		cctxt->sched_clnt_hdl->tkns++;
-	else if (!cctxt->decoding) {
-		vcd_send_frame_done_in_eos(cctxt, input_frame, false);
-		if (cctxt->status.mask & VCD_EOS_WAIT_OP_BUF) {
-			vcd_do_client_state_transition(cctxt,
-				VCD_CLIENT_STATE_EOS,
-				CLIENT_STATE_EVENT_NUMBER
-				(encode_frame));
+	else if (!cctxt->decoding && !cctxt->status.frame_delayed) {
+		if (!cctxt->status.frame_submitted) {
+			vcd_send_frame_done_in_eos(cctxt, input_frame, false);
+			if (cctxt->status.mask & VCD_EOS_WAIT_OP_BUF)
+				vcd_do_client_state_transition(cctxt,
+					VCD_CLIENT_STATE_EOS,
+					CLIENT_STATE_EVENT_NUMBER
+					(encode_frame));
+		} else {
+			transc = vcd_get_first_in_use_trans_for_clnt(cctxt);
+			if (transc) {
+				transc->flags |= VCD_FRAME_FLAG_EOS;
+				VCD_MSG_HIGH("%s: Add EOS flag to transc",
+				       __func__);
+			}
 		}
 		*pb_eos_handled = true;
 	}
@@ -2057,10 +2112,12 @@ u32 vcd_handle_input_done_in_eos(
 		transc->in_use = true;
 		if ((codec_config &&
 			 (status != VCD_ERR_BITSTREAM_ERR)) ||
-			((status == VCD_ERR_BITSTREAM_ERR) &&
+			(codec_config && (status == VCD_ERR_BITSTREAM_ERR) &&
 			 !(cctxt->status.mask & VCD_FIRST_IP_DONE) &&
-			 (core_type == VCD_CORE_720P)))
+			(core_type == VCD_CORE_720P))) {
+			VCD_MSG_HIGH("handle EOS for codec config");
 			vcd_handle_eos_done(cctxt, transc, VCD_S_SUCCESS);
+		}
 	}
 	return rc;
 }
@@ -2091,8 +2148,8 @@ u32 vcd_validate_io_done_pyld(
 		rc = VCD_ERR_CLIENT_FATAL;
 
 	if (VCD_FAILED(rc)) {
-		VCD_MSG_FATAL(
-			"vcd_validate_io_done_pyld: invalid transaction");
+		VCD_MSG_FATAL("vcd_validate_io_done_pyld: "\
+			"invalid transaction 0x%x", (u32)transc);
 	} else if (!frame->vcd_frm.virtual &&
 		status != VCD_ERR_INTRLCD_FIELD_DROP)
 		rc = VCD_ERR_BAD_POINTER;
@@ -3034,6 +3091,7 @@ u32 vcd_req_perf_level(
 {
 	u32 rc;
 	u32 res_trk_perf_level;
+	u32 turbo_perf_level;
 	if (!perf_level) {
 		VCD_MSG_ERROR("Invalid parameters\n");
 		return -EINVAL;
@@ -3043,10 +3101,13 @@ u32 vcd_req_perf_level(
 		rc = -ENOTSUPP;
 		goto perf_level_not_supp;
 	}
+	turbo_perf_level = get_res_trk_perf_level(VCD_PERF_LEVEL_TURBO);
 	rc = vcd_set_perf_level(cctxt->dev_ctxt, res_trk_perf_level);
 	if (!rc) {
 		cctxt->reqd_perf_lvl = res_trk_perf_level;
 		cctxt->perf_set_by_client = 1;
+		if (res_trk_perf_level == turbo_perf_level)
+			cctxt->is_turbo_enabled = true;
 	}
 perf_level_not_supp:
 	return rc;
@@ -3441,7 +3502,8 @@ u32 vcd_set_num_slices(struct vcd_clnt_ctxt *cctxt)
 	struct vcd_property_slice_delivery_info slice_delivery_info;
 	u32 rc = VCD_S_SUCCESS;
 	prop_hdr.prop_id = VCD_I_SLICE_DELIVERY_MODE;
-	prop_hdr.sz = sizeof(struct vcd_property_slice_delivery_info);
+	prop_hdr.sz =
+		sizeof(struct vcd_property_slice_delivery_info);
 	rc = ddl_get_property(cctxt->ddl_handle, &prop_hdr,
 				&slice_delivery_info);
 	VCD_FAILED_RETURN(rc, "Failed: Get VCD_I_SLICE_DELIVERY_MODE");

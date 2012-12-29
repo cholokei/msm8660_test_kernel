@@ -90,7 +90,7 @@
 
 #define MODULE_NAME "msm_cache_erp"
 
-#define ERP_LOG_MAGIC_ADDR	0x748
+#define ERP_LOG_MAGIC_ADDR	0x6A4
 #define ERP_LOG_MAGIC		0x11C39893
 
 struct msm_l1_err_stats {
@@ -253,20 +253,11 @@ static irqreturn_t msm_l1_erp_irq(int irq, void *dev_id)
 	int print_regs = cesr & CESR_PRINT_MASK;
 	int log_event = cesr & CESR_LOG_EVENT_MASK;
 
-	void *const saw_bases[] = {
-		MSM_SAW0_BASE,
-		MSM_SAW1_BASE,
-	};
-
 	if (print_regs) {
 		pr_alert("L1 / TLB Error detected on CPU %d!\n", cpu);
 		pr_alert("\tCESR      = 0x%08x\n", cesr);
 		pr_alert("\tCPU speed = %lu\n", acpuclk_get_rate(cpu));
 		pr_alert("\tMIDR      = 0x%08x\n", read_cpuid_id());
-		pr_alert("\tPTE fuses = 0x%08x\n",
-					readl_relaxed(MSM_QFPROM_BASE + 0xC0));
-		pr_alert("\tPMIC_VREG = 0x%08x\n",
-					readl_relaxed(saw_bases[cpu] + 0x14));
 	}
 
 	if (cesr & CESR_DCTPE) {
@@ -548,12 +539,18 @@ static int msm_cache_erp_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static struct of_device_id cache_erp_match_table[] = {
+	{	.compatible = "qcom,cache_erp",	},
+	{}
+};
+
 static struct platform_driver msm_cache_erp_driver = {
 	.probe = msm_cache_erp_probe,
 	.remove = msm_cache_erp_remove,
 	.driver = {
 		.name = MODULE_NAME,
 		.owner = THIS_MODULE,
+		.of_match_table = cache_erp_match_table,
 	},
 };
 

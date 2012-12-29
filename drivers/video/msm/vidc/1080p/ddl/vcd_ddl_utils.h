@@ -38,13 +38,15 @@ do { \
 #define DDL_MSG_LOW(x...)    printk(KERN_INFO x)
 #define DDL_MSG_MED(x...)    printk(KERN_INFO x)
 #define DDL_MSG_HIGH(x...)   printk(KERN_INFO x)
+#define DDL_MSG_ERROR(x...)  printk(KERN_INFO x)
 #else
 #define DDL_MSG_LOW(x...)
 #define DDL_MSG_MED(x...)
 #define DDL_MSG_HIGH(x...)
+#define DDL_MSG_ERROR(x...)
 #endif
 
-#define DDL_MSG_ERROR(x...)  printk(KERN_INFO x)
+
 #define DDL_MSG_FATAL(x...)  printk(KERN_INFO x)
 
 #define DDL_ALIGN_SIZE(sz, guard_bytes, align_mask) \
@@ -62,7 +64,8 @@ do { \
 #define DDL_GET_ALIGNED_VITUAL(x)   ((x).align_virtual_addr)
 #define DDL_KILO_BYTE(x)   ((x)*1024)
 #define DDL_MEGA_BYTE(x)   ((x)*1024*1024)
-#define DDL_FRAMERATE_SCALE(x)            ((x) * 1000)
+#define DDL_FRAMERATE_SCALE_FACTOR      (1000)
+#define DDL_FRAMERATE_SCALE(x)          ((x) * DDL_FRAMERATE_SCALE_FACTOR)
 
 #define DDL_MIN(x, y)  ((x < y) ? x : y)
 #define DDL_MAX(x, y)  ((x > y) ? x : y)
@@ -70,8 +73,9 @@ do { \
 #define DDL_MEMSET(src, value, len) memset((src), (value), (len))
 
 void ddl_set_core_start_time(const char *func_name, u32 index);
-void ddl_calc_core_proc_time(const char *func_name, u32 index);
 void ddl_reset_core_time_variables(u32 index);
 void ddl_calc_core_proc_time_cnt(const char *func_name, u32 index, u32 count);
 void ddl_update_core_start_time(const char *func_name, u32 index);
+int ddl_get_core_decode_proc_time(u32 *ddl_handle);
+void ddl_reset_avg_dec_time(u32 *ddl_handle);
 #endif

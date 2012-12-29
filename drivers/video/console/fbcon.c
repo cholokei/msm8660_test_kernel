@@ -77,7 +77,6 @@
 #include <linux/crc32.h> /* For counting font checksums */
 #include <asm/fb.h>
 #include <asm/irq.h>
-#include <asm/system.h>
 
 #include "fbcon.h"
 
@@ -373,15 +372,8 @@ static void fb_flashcursor(struct work_struct *work)
 	struct vc_data *vc = NULL;
 	int c;
 	int mode;
-	int ret;
 
-	/* FIXME: we should sort out the unbind locking instead */
-	/* instead we just fail to flash the cursor if we can't get
-	 * the lock instead of blocking fbcon deinit */
-	ret = console_trylock();
-	if (ret == 0)
-		return;
-
+	console_lock();
 	if (ops && ops->currcon != -1)
 		vc = vc_cons[ops->currcon].d;
 
@@ -450,7 +442,7 @@ static int __init fb_console_setup(char *this_opt)
 
 	while ((options = strsep(&this_opt, ",")) != NULL) {
 		if (!strncmp(options, "font:", 5))
-			strncpy(fontname, options + 5, sizeof(fontname)/*40*/);
+			strcpy(fontname, options + 5);
 		
 		if (!strncmp(options, "scrollback:", 11)) {
 			options += 11;
@@ -2199,10 +2191,6 @@ static int fbcon_switch(struct vc_data *vc)
 	 */
 	info->var.activate = var.activate;
 	var.vmode |= info->var.vmode & ~FB_VMODE_MASK;
-
-       /* Retain the reserved[] array  */
-       memcpy(var.reserved, info->var.reserved, sizeof(var.reserved));	
-
 	fb_set_var(info, &var);
 	ops->var = info->var;
 

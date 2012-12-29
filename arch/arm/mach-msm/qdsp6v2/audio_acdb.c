@@ -10,17 +10,25 @@
  * GNU General Public License for more details.
  *
  */
+#include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/module.h>
 #include <linux/miscdevice.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
-#include <linux/android_pmem.h>
+#include <linux/msm_ion.h>
 #include <linux/mm.h>
 #include <mach/qdsp6v2/audio_acdb.h>
 
 
-#define MAX_NETWORKS		12
+#define MAX_NETWORKS			15
+#define MAX_IOCTL_DATA			(MAX_NETWORKS * 2)
+#define MAX_COL_SIZE			324
+
+#define ACDB_BLOCK_SIZE			4096
+#define NUM_VOCPROC_BLOCKS		(6 * MAX_NETWORKS)
+#define ACDB_TOTAL_VOICE_ALLOCATION	(ACDB_BLOCK_SIZE * NUM_VOCPROC_BLOCKS)
+
 
 struct sidetone_atomic_cal {
 	atomic_t	enable;
@@ -56,19 +64,28 @@ struct acdb_data {
 	atomic_t			vocstrm_total_cal_size;
 	atomic_t			vocvol_total_cal_size;
 
+	/* Voice Column data */
+	struct acdb_atomic_cal_block	vocproc_col_cal[MAX_VOCPROC_TYPES];
+	uint32_t			*col_data[MAX_VOCPROC_TYPES];
+
+	/* VocProc dev cfg cal*/
+	struct acdb_atomic_cal_block	vocproc_dev_cal[MAX_NETWORKS];
+	atomic_t			vocproc_dev_cal_size;
+	atomic_t			vocproc_dev_total_cal_size;
+
 	/* AFE cal */
 	struct acdb_atomic_cal_block	afe_cal[MAX_AUDPROC_TYPES];
 
 	/* Sidetone Cal */
 	struct sidetone_atomic_cal	sidetone_cal;
 
-	/* PMEM information */
-	atomic_t			pmem_fd;
+	/* Allocation information */
+	struct ion_client		*ion_client;
+	struct ion_handle		*ion_handle;
+	atomic_t			map_handle;
 	atomic64_t			paddr;
 	atomic64_t			kvaddr;
-	atomic64_t			pmem_len;
-	struct file			*file;
-
+	atomic64_t			mem_len;
 };
 
 static struct acdb_data		acdb_data;
@@ -124,6 +141,15 @@ void store_asm_topology(uint32_t topology)
 	atomic_set(&acdb_data.asm_topology, topology);
 }
 
+void get_voice_cal_allocation(struct acdb_cal_block *cal_block)
+{
+	cal_block->cal_kvaddr =
+		atomic_read(&acdb_data.vocproc_cal[0].cal_kvaddr);
+	cal_block->cal_paddr =
+		atomic_read(&acdb_data.vocproc_cal[0].cal_paddr);
+	cal_block->cal_size = ACDB_TOTAL_VOICE_ALLOCATION;
+}
+
 void get_all_voice_cal(struct acdb_cal_block *cal_block)
 {
 	cal_block->cal_kvaddr =
@@ -177,6 +203,45 @@ void get_all_vocvol_cal(struct acdb_cal_block *cal_block)
 		atomic_read(&acdb_data.vocvol_total_cal_size);
 }
 
+void get_voice_col_data(uint32_t vocproc_type,
+			struct acdb_cal_block *cal_block)
+{
+	if (cal_block == NULL) {
+		pr_err("ACDB=> NULL pointer sent to %s\n", __func__);
+		goto done;
+	}
+
+	cal_block->cal_kvaddr = atomic_read(&acdb_data.
+				vocproc_col_cal[vocproc_type].cal_kvaddr);
+	cal_block->cal_paddr = atomic_read(&acdb_data.
+				vocproc_col_cal[vocproc_type].cal_paddr);
+	cal_block->cal_size = atomic_read(&acdb_data.
+				vocproc_col_cal[vocproc_type].cal_size);
+done:
+	return;
+}
+
+void store_voice_col_data(uint32_t vocproc_type, uint32_t cal_size,
+			  uint32_t *cal_data)
+{
+	if (cal_size > MAX_COL_SIZE) {
+		pr_err("%s: col size is to big %d\n", __func__,
+				cal_size);
+		goto done;
+	}
+	if (copy_from_user(acdb_data.col_data[vocproc_type],
+			(void *)((uint8_t *)cal_data + sizeof(cal_size)),
+			cal_size)) {
+		pr_err("%s: fail to copy col size %d\n",
+			__func__, cal_size);
+		goto done;
+	}
+	atomic_set(&acdb_data.vocproc_col_cal[vocproc_type].cal_size,
+		cal_size);
+done:
+	return;
+}
+
 void get_anc_cal(struct acdb_cal_block *cal_block)
 {
 	pr_debug("%s\n", __func__);
@@ -200,10 +265,10 @@ void store_anc_cal(struct cal_block *cal_block)
 {
 	pr_debug("%s,\n", __func__);
 
-	if (cal_block->cal_offset > atomic64_read(&acdb_data.pmem_len)) {
-		pr_err("%s: offset %d is > pmem_len %ld\n",
+	if (cal_block->cal_offset > atomic64_read(&acdb_data.mem_len)) {
+		pr_err("%s: offset %d is > mem_len %ld\n",
 			__func__, cal_block->cal_offset,
-			(long)atomic64_read(&acdb_data.pmem_len));
+			(long)atomic64_read(&acdb_data.mem_len));
 		goto done;
 	}
 
@@ -221,10 +286,10 @@ void store_afe_cal(int32_t path, struct cal_block *cal_block)
 {
 	pr_debug("%s, path = %d\n", __func__, path);
 
-	if (cal_block->cal_offset > atomic64_read(&acdb_data.pmem_len)) {
-		pr_err("%s: offset %d is > pmem_len %ld\n",
+	if (cal_block->cal_offset > atomic64_read(&acdb_data.mem_len)) {
+		pr_err("%s: offset %d is > mem_len %ld\n",
 			__func__, cal_block->cal_offset,
-			(long)atomic64_read(&acdb_data.pmem_len));
+			(long)atomic64_read(&acdb_data.mem_len));
 		goto done;
 	}
 	if ((path >= MAX_AUDPROC_TYPES) || (path < 0)) {
@@ -271,10 +336,10 @@ void store_audproc_cal(int32_t path, struct cal_block *cal_block)
 {
 	pr_debug("%s, path = %d\n", __func__, path);
 
-	if (cal_block->cal_offset > atomic64_read(&acdb_data.pmem_len)) {
-		pr_err("%s: offset %d is > pmem_len %ld\n",
+	if (cal_block->cal_offset > atomic64_read(&acdb_data.mem_len)) {
+		pr_err("%s: offset %d is > mem_len %ld\n",
 			__func__, cal_block->cal_offset,
-			(long)atomic64_read(&acdb_data.pmem_len));
+			(long)atomic64_read(&acdb_data.mem_len));
 		goto done;
 	}
 	if (path >= MAX_AUDPROC_TYPES) {
@@ -321,10 +386,10 @@ void store_audstrm_cal(int32_t path, struct cal_block *cal_block)
 {
 	pr_debug("%s, path = %d\n", __func__, path);
 
-	if (cal_block->cal_offset > atomic64_read(&acdb_data.pmem_len)) {
-		pr_err("%s: offset %d is > pmem_len %ld\n",
+	if (cal_block->cal_offset > atomic64_read(&acdb_data.mem_len)) {
+		pr_err("%s: offset %d is > mem_len %ld\n",
 			__func__, cal_block->cal_offset,
-			(long)atomic64_read(&acdb_data.pmem_len));
+			(long)atomic64_read(&acdb_data.mem_len));
 		goto done;
 	}
 	if (path >= MAX_AUDPROC_TYPES) {
@@ -371,10 +436,10 @@ void store_audvol_cal(int32_t path, struct cal_block *cal_block)
 {
 	pr_debug("%s, path = %d\n", __func__, path);
 
-	if (cal_block->cal_offset > atomic64_read(&acdb_data.pmem_len)) {
-		pr_err("%s: offset %d is > pmem_len %ld\n",
+	if (cal_block->cal_offset > atomic64_read(&acdb_data.mem_len)) {
+		pr_err("%s: offset %d is > mem_len %ld\n",
 			__func__, cal_block->cal_offset,
-			(long)atomic64_read(&acdb_data.pmem_len));
+			(long)atomic64_read(&acdb_data.mem_len));
 		goto done;
 	}
 	if (path >= MAX_AUDPROC_TYPES) {
@@ -417,6 +482,56 @@ done:
 	return;
 }
 
+void store_vocproc_dev_cfg_cal(int32_t len, struct cal_block *cal_blocks)
+{
+	int i;
+	pr_debug("%s\n", __func__);
+
+	if (len > MAX_NETWORKS) {
+		pr_err("%s: Calibration sent for %d networks, only %d are supported!\n",
+			__func__, len, MAX_NETWORKS);
+		goto done;
+	}
+
+	atomic_set(&acdb_data.vocproc_dev_total_cal_size, 0);
+	for (i = 0; i < len; i++) {
+		if (cal_blocks[i].cal_offset >
+					atomic64_read(&acdb_data.mem_len)) {
+			pr_err("%s: offset %d is > mem_len %ld\n",
+				__func__, cal_blocks[i].cal_offset,
+				(long)atomic64_read(&acdb_data.mem_len));
+			atomic_set(&acdb_data.vocproc_dev_cal[i].cal_size, 0);
+		} else {
+			atomic_add(cal_blocks[i].cal_size,
+				&acdb_data.vocproc_dev_total_cal_size);
+			atomic_set(&acdb_data.vocproc_dev_cal[i].cal_size,
+				cal_blocks[i].cal_size);
+			atomic_set(&acdb_data.vocproc_dev_cal[i].cal_paddr,
+				cal_blocks[i].cal_offset +
+				atomic64_read(&acdb_data.paddr));
+			atomic_set(&acdb_data.vocproc_dev_cal[i].cal_kvaddr,
+				cal_blocks[i].cal_offset +
+				atomic64_read(&acdb_data.kvaddr));
+		}
+	}
+	atomic_set(&acdb_data.vocproc_dev_cal_size, len);
+done:
+	return;
+}
+
+void get_vocproc_dev_cfg_cal(struct acdb_cal_block *cal_block)
+{
+	pr_debug("%s\n", __func__);
+
+	cal_block->cal_kvaddr =
+		atomic_read(&acdb_data.vocproc_dev_cal[0].cal_kvaddr);
+	cal_block->cal_paddr =
+		atomic_read(&acdb_data.vocproc_dev_cal[0].cal_paddr);
+	cal_block->cal_size =
+		atomic_read(&acdb_data.vocproc_dev_total_cal_size);
+}
+
+
 
 void store_vocproc_cal(int32_t len, struct cal_block *cal_blocks)
 {
@@ -432,10 +547,10 @@ void store_vocproc_cal(int32_t len, struct cal_block *cal_blocks)
 	atomic_set(&acdb_data.vocproc_total_cal_size, 0);
 	for (i = 0; i < len; i++) {
 		if (cal_blocks[i].cal_offset >
-					atomic64_read(&acdb_data.pmem_len)) {
-			pr_err("%s: offset %d is > pmem_len %ld\n",
+					atomic64_read(&acdb_data.mem_len)) {
+			pr_err("%s: offset %d is > mem_len %ld\n",
 				__func__, cal_blocks[i].cal_offset,
-				(long)atomic64_read(&acdb_data.pmem_len));
+				(long)atomic64_read(&acdb_data.mem_len));
 			atomic_set(&acdb_data.vocproc_cal[i].cal_size, 0);
 		} else {
 			atomic_add(cal_blocks[i].cal_size,
@@ -484,10 +599,10 @@ void store_vocstrm_cal(int32_t len, struct cal_block *cal_blocks)
 	atomic_set(&acdb_data.vocstrm_total_cal_size, 0);
 	for (i = 0; i < len; i++) {
 		if (cal_blocks[i].cal_offset >
-					atomic64_read(&acdb_data.pmem_len)) {
-			pr_err("%s: offset %d is > pmem_len %ld\n",
+					atomic64_read(&acdb_data.mem_len)) {
+			pr_err("%s: offset %d is > mem_len %ld\n",
 				__func__, cal_blocks[i].cal_offset,
-				(long)atomic64_read(&acdb_data.pmem_len));
+				(long)atomic64_read(&acdb_data.mem_len));
 			atomic_set(&acdb_data.vocstrm_cal[i].cal_size, 0);
 		} else {
 			atomic_add(cal_blocks[i].cal_size,
@@ -536,10 +651,10 @@ void store_vocvol_cal(int32_t len, struct cal_block *cal_blocks)
 	atomic_set(&acdb_data.vocvol_total_cal_size, 0);
 	for (i = 0; i < len; i++) {
 		if (cal_blocks[i].cal_offset >
-					atomic64_read(&acdb_data.pmem_len)) {
-			pr_err("%s: offset %d is > pmem_len %ld\n",
+					atomic64_read(&acdb_data.mem_len)) {
+			pr_err("%s: offset %d is > mem_len %ld\n",
 				__func__, cal_blocks[i].cal_offset,
-				(long)atomic64_read(&acdb_data.pmem_len));
+				(long)atomic64_read(&acdb_data.mem_len));
 			atomic_set(&acdb_data.vocvol_cal[i].cal_size, 0);
 		} else {
 			atomic_add(cal_blocks[i].cal_size,
@@ -603,8 +718,9 @@ static int acdb_open(struct inode *inode, struct file *f)
 	s32 result = 0;
 	pr_debug("%s\n", __func__);
 
-	if (atomic_read(&acdb_data.pmem_fd)) {
-		pr_debug("%s: ACDB opened but PMEM allocated, using existing PMEM!\n",
+	if (atomic64_read(&acdb_data.mem_len)) {
+		pr_debug("%s: ACDB opened but memory allocated, "
+			"using existing allocation!\n",
 			__func__);
 	}
 
@@ -612,46 +728,96 @@ static int acdb_open(struct inode *inode, struct file *f)
 	return result;
 }
 
-static int deregister_pmem(void)
+static int deregister_memory(void)
 {
-	if (atomic_read(&acdb_data.pmem_fd)) {
+	int i;
+
+	if (atomic64_read(&acdb_data.mem_len)) {
 		mutex_lock(&acdb_data.acdb_mutex);
-		put_pmem_file(acdb_data.file);
+		atomic64_set(&acdb_data.mem_len, 0);
+		atomic_set(&acdb_data.vocstrm_total_cal_size, 0);
+		atomic_set(&acdb_data.vocproc_total_cal_size, 0);
+		atomic_set(&acdb_data.vocvol_total_cal_size, 0);
+
+		for (i = 0; i < MAX_VOCPROC_TYPES; i++) {
+			kfree(acdb_data.col_data[i]);
+			acdb_data.col_data[i] = NULL;
+		}
+		ion_unmap_kernel(acdb_data.ion_client, acdb_data.ion_handle);
+		ion_free(acdb_data.ion_client, acdb_data.ion_handle);
+		ion_client_destroy(acdb_data.ion_client);
 		mutex_unlock(&acdb_data.acdb_mutex);
-		atomic_set(&acdb_data.pmem_fd, 0);
 	}
 	return 0;
 }
 
-static int register_pmem(void)
+static int register_memory(void)
 {
-	int result;
-	unsigned long paddr;
-	unsigned long kvaddr;
-	unsigned long pmem_len;
+	int			result;
+	int			i;
+	unsigned long		paddr;
+	void                    *kvptr;
+	unsigned long		kvaddr;
+	unsigned long		mem_len;
 
 	mutex_lock(&acdb_data.acdb_mutex);
-	result = get_pmem_file(atomic_read(&acdb_data.pmem_fd),
-				&paddr, &kvaddr, &pmem_len,
-				&acdb_data.file);
-	mutex_unlock(&acdb_data.acdb_mutex);
-	if (result != 0) {
-		atomic_set(&acdb_data.pmem_fd, 0);
-		atomic64_set(&acdb_data.pmem_len, 0);
-		pr_err("%s: Could not register PMEM!!!\n", __func__);
-		goto done;
+	for (i = 0; i < MAX_VOCPROC_TYPES; i++) {
+		acdb_data.col_data[i] = kmalloc(MAX_COL_SIZE, GFP_KERNEL);
+		atomic_set(&acdb_data.vocproc_col_cal[i].cal_kvaddr,
+			(uint32_t)acdb_data.col_data[i]);
 	}
 
+	acdb_data.ion_client =
+		msm_ion_client_create(UINT_MAX, "audio_acdb_client");
+	if (IS_ERR_OR_NULL(acdb_data.ion_client)) {
+		pr_err("%s: Could not register ION client!!!\n", __func__);
+		result = PTR_ERR(acdb_data.ion_client);
+		goto err;
+	}
+
+	acdb_data.ion_handle = ion_import_dma_buf(acdb_data.ion_client,
+		atomic_read(&acdb_data.map_handle));
+	if (IS_ERR_OR_NULL(acdb_data.ion_handle)) {
+		pr_err("%s: Could not import map handle!!!\n", __func__);
+		result = PTR_ERR(acdb_data.ion_handle);
+		goto err_ion_client;
+	}
+
+	result = ion_phys(acdb_data.ion_client, acdb_data.ion_handle,
+				&paddr, (size_t *)&mem_len);
+	if (result != 0) {
+		pr_err("%s: Could not get phys addr!!!\n", __func__);
+		goto err_ion_handle;
+	}
+
+	kvptr = ion_map_kernel(acdb_data.ion_client,
+		acdb_data.ion_handle);
+	if (IS_ERR_OR_NULL(kvptr)) {
+		pr_err("%s: Could not get kernel virt addr!!!\n", __func__);
+		result = PTR_ERR(kvptr);
+		goto err_ion_handle;
+	}
+	kvaddr = (unsigned long)kvptr;
 	atomic64_set(&acdb_data.paddr, paddr);
 	atomic64_set(&acdb_data.kvaddr, kvaddr);
-	atomic64_set(&acdb_data.pmem_len, pmem_len);
-	pr_debug("AUDIO_REGISTER_PMEM done! paddr = 0x%lx, "
+	atomic64_set(&acdb_data.mem_len, mem_len);
+	mutex_unlock(&acdb_data.acdb_mutex);
+
+	pr_debug("%s done! paddr = 0x%lx, "
 		"kvaddr = 0x%lx, len = x%lx\n",
+		 __func__,
 		(long)atomic64_read(&acdb_data.paddr),
 		(long)atomic64_read(&acdb_data.kvaddr),
-		(long)atomic64_read(&acdb_data.pmem_len));
+		(long)atomic64_read(&acdb_data.mem_len));
 
-done:
+	return result;
+err_ion_handle:
+	ion_free(acdb_data.ion_client, acdb_data.ion_handle);
+err_ion_client:
+	ion_client_destroy(acdb_data.ion_client);
+err:
+	atomic64_set(&acdb_data.mem_len, 0);
+	mutex_unlock(&acdb_data.acdb_mutex);
 	return result;
 }
 static long acdb_ioctl(struct file *f,
@@ -659,31 +825,31 @@ static long acdb_ioctl(struct file *f,
 {
 	int32_t			result = 0;
 	int32_t			size;
-	int32_t			pmem_fd;
+	int32_t			map_fd;
 	uint32_t		topology;
-	struct cal_block	data[MAX_NETWORKS];
+	uint32_t		data[MAX_IOCTL_DATA];
 	pr_debug("%s\n", __func__);
 
 	switch (cmd) {
 	case AUDIO_REGISTER_PMEM:
 		pr_debug("AUDIO_REGISTER_PMEM\n");
-		if (atomic_read(&acdb_data.pmem_fd)) {
-			deregister_pmem();
-			pr_debug("Remove the existing PMEM\n");
+		if (atomic_read(&acdb_data.mem_len)) {
+			deregister_memory();
+			pr_debug("Remove the existing memory\n");
 		}
 
-		if (copy_from_user(&pmem_fd, (void *)arg, sizeof(pmem_fd))) {
-			pr_err("%s: fail to copy pmem handle!\n", __func__);
+		if (copy_from_user(&map_fd, (void *)arg, sizeof(map_fd))) {
+			pr_err("%s: fail to copy memory handle!\n", __func__);
 			result = -EFAULT;
 		} else {
-			atomic_set(&acdb_data.pmem_fd, pmem_fd);
-			result = register_pmem();
+			atomic_set(&acdb_data.map_handle, map_fd);
+			result = register_memory();
 		}
 		goto done;
 
 	case AUDIO_DEREGISTER_PMEM:
 		pr_debug("AUDIO_DEREGISTER_PMEM\n");
-		deregister_pmem();
+		deregister_memory();
 		goto done;
 	case AUDIO_SET_VOICE_RX_TOPOLOGY:
 		if (copy_from_user(&topology, (void *)arg,
@@ -740,6 +906,18 @@ static long acdb_ioctl(struct file *f,
 		goto done;
 	}
 
+	switch (cmd) {
+	case AUDIO_SET_VOCPROC_COL_CAL:
+		store_voice_col_data(VOCPROC_CAL, size, (uint32_t *)arg);
+		goto done;
+	case AUDIO_SET_VOCSTRM_COL_CAL:
+		store_voice_col_data(VOCSTRM_CAL, size, (uint32_t *)arg);
+		goto done;
+	case AUDIO_SET_VOCVOL_COL_CAL:
+		store_voice_col_data(VOCVOL_CAL, size, (uint32_t *)arg);
+		goto done;
+	}
+
 	if (copy_from_user(data, (void *)(arg + sizeof(size)), size)) {
 
 		pr_err("%s: fail to copy table size %d\n", __func__, size);
@@ -758,58 +936,65 @@ static long acdb_ioctl(struct file *f,
 		if (size > sizeof(struct cal_block))
 			pr_err("%s: More Audproc Cal then expected, "
 				"size received: %d\n", __func__, size);
-		store_audproc_cal(TX_CAL, data);
+		store_audproc_cal(TX_CAL, (struct cal_block *)data);
 		break;
 	case AUDIO_SET_AUDPROC_RX_CAL:
 		if (size > sizeof(struct cal_block))
 			pr_err("%s: More Audproc Cal then expected, "
 				"size received: %d\n", __func__, size);
-		store_audproc_cal(RX_CAL, data);
+		store_audproc_cal(RX_CAL, (struct cal_block *)data);
 		break;
 	case AUDIO_SET_AUDPROC_TX_STREAM_CAL:
 		if (size > sizeof(struct cal_block))
 			pr_err("%s: More Audproc Cal then expected, "
 				"size received: %d\n", __func__, size);
-		store_audstrm_cal(TX_CAL, data);
+		store_audstrm_cal(TX_CAL, (struct cal_block *)data);
 		break;
 	case AUDIO_SET_AUDPROC_RX_STREAM_CAL:
 		if (size > sizeof(struct cal_block))
 			pr_err("%s: More Audproc Cal then expected, "
 				"size received: %d\n", __func__, size);
-		store_audstrm_cal(RX_CAL, data);
+		store_audstrm_cal(RX_CAL, (struct cal_block *)data);
 		break;
 	case AUDIO_SET_AUDPROC_TX_VOL_CAL:
 		if (size > sizeof(struct cal_block))
 			pr_err("%s: More Audproc Cal then expected, "
 				"size received: %d\n", __func__, size);
-		store_audvol_cal(TX_CAL, data);
+		store_audvol_cal(TX_CAL, (struct cal_block *)data);
 		break;
 	case AUDIO_SET_AUDPROC_RX_VOL_CAL:
 		if (size > sizeof(struct cal_block))
 			pr_err("%s: More Audproc Cal then expected, "
 				"size received: %d\n", __func__, size);
-		store_audvol_cal(RX_CAL, data);
+		store_audvol_cal(RX_CAL, (struct cal_block *)data);
 		break;
 	case AUDIO_SET_AFE_TX_CAL:
 		if (size > sizeof(struct cal_block))
 			pr_err("%s: More AFE Cal then expected, "
 				"size received: %d\n", __func__, size);
-		store_afe_cal(TX_CAL, data);
+		store_afe_cal(TX_CAL, (struct cal_block *)data);
 		break;
 	case AUDIO_SET_AFE_RX_CAL:
 		if (size > sizeof(struct cal_block))
 			pr_err("%s: More AFE Cal then expected, "
 				"size received: %d\n", __func__, size);
-		store_afe_cal(RX_CAL, data);
+		store_afe_cal(RX_CAL, (struct cal_block *)data);
 		break;
 	case AUDIO_SET_VOCPROC_CAL:
-		store_vocproc_cal(size / sizeof(struct cal_block), data);
+		store_vocproc_cal(size / sizeof(struct cal_block),
+						(struct cal_block *)data);
 		break;
 	case AUDIO_SET_VOCPROC_STREAM_CAL:
-		store_vocstrm_cal(size / sizeof(struct cal_block), data);
+		store_vocstrm_cal(size / sizeof(struct cal_block),
+						(struct cal_block *)data);
 		break;
 	case AUDIO_SET_VOCPROC_VOL_CAL:
-		store_vocvol_cal(size / sizeof(struct cal_block), data);
+		store_vocvol_cal(size / sizeof(struct cal_block),
+						(struct cal_block *)data);
+		break;
+	case AUDIO_SET_VOCPROC_DEV_CFG_CAL:
+		store_vocproc_dev_cfg_cal(size / sizeof(struct cal_block),
+						(struct cal_block *)data);
 		break;
 	case AUDIO_SET_SIDETONE_CAL:
 		if (size > sizeof(struct sidetone_cal))
@@ -818,7 +1003,7 @@ static long acdb_ioctl(struct file *f,
 		store_sidetone_cal((struct sidetone_cal *)data);
 		break;
 	case AUDIO_SET_ANC_CAL:
-		store_anc_cal(data);
+		store_anc_cal((struct cal_block *)data);
 		break;
 	default:
 		pr_err("ACDB=> ACDB ioctl not found!\n");
@@ -835,8 +1020,8 @@ static int acdb_mmap(struct file *file, struct vm_area_struct *vma)
 
 	pr_debug("%s\n", __func__);
 
-	if (atomic_read(&acdb_data.pmem_fd)) {
-		if (size <= atomic64_read(&acdb_data.pmem_len)) {
+	if (atomic64_read(&acdb_data.mem_len)) {
+		if (size <= atomic64_read(&acdb_data.mem_len)) {
 			vma->vm_page_prot = pgprot_noncached(
 						vma->vm_page_prot);
 			result = remap_pfn_range(vma,
@@ -845,11 +1030,11 @@ static int acdb_mmap(struct file *file, struct vm_area_struct *vma)
 				size,
 				vma->vm_page_prot);
 		} else {
-			pr_err("%s: Not enough PMEM memory!\n", __func__);
+			pr_err("%s: Not enough memory!\n", __func__);
 			result = -ENOMEM;
 		}
 	} else {
-		pr_err("%s: PMEM is not allocated, yet!\n", __func__);
+		pr_err("%s: memory is not allocated, yet!\n", __func__);
 		result = -ENODEV;
 	}
 
@@ -869,7 +1054,7 @@ static int acdb_release(struct inode *inode, struct file *f)
 	if (atomic_read(&usage_count) >= 1)
 		result = -EBUSY;
 	else
-		result = deregister_pmem();
+		result = deregister_memory();
 
 	return result;
 }
@@ -893,6 +1078,7 @@ static int __init acdb_init(void)
 	memset(&acdb_data, 0, sizeof(acdb_data));
 	mutex_init(&acdb_data.acdb_mutex);
 	atomic_set(&usage_count, 0);
+
 	return misc_register(&acdb_misc);
 }
 

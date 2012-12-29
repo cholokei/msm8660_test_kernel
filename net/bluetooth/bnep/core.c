@@ -26,6 +26,7 @@
 */
 
 #include <linux/module.h>
+#include <linux/interrupt.h>
 
 #include <linux/kernel.h>
 #include <linux/sched.h>
@@ -55,9 +56,12 @@
 #include "bnep.h"
 
 #define VERSION "1.3"
+/* As this feature is dummy for BNEP net device
+** disabling support */
+#undef CONFIG_BT_BNEP_MC_FILTER
 
-static int compress_src = 1;
-static int compress_dst = 1;
+static bool compress_src = 1;
+static bool compress_dst = 1;
 
 static LIST_HEAD(bnep_session_list);
 static DECLARE_RWSEM(bnep_session_sem);
@@ -492,7 +496,10 @@ static int bnep_session(void *arg)
 		/* RX */
 		while ((skb = skb_dequeue(&sk->sk_receive_queue))) {
 			skb_orphan(skb);
-			bnep_rx_frame(s, skb);
+			if (!skb_linearize(skb))
+				bnep_rx_frame(s, skb);
+			else
+				kfree_skb(skb);
 		}
 
 		if (sk->sk_state != BT_CONNECTED)
@@ -506,7 +513,7 @@ static int bnep_session(void *arg)
 
 		schedule();
 	}
-	__set_current_state(TASK_RUNNING);
+	set_current_state(TASK_RUNNING);
 	remove_wait_queue(sk_sleep(sk), &wait);
 
 	/* Cleanup session */

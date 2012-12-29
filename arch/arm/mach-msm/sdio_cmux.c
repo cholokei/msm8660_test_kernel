@@ -12,6 +12,7 @@
 
 #define DEBUG
 
+#include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/device.h>
 #include <linux/delay.h>
@@ -24,6 +25,7 @@
 #include <linux/slab.h>
 #include <linux/termios.h>
 #include <linux/debugfs.h>
+#include <linux/moduleparam.h>
 
 #include <mach/sdio_al.h>
 #include <mach/sdio_cmux.h>
@@ -209,11 +211,6 @@ static int sdio_cmux_write_cmd(const int id, enum cmd_type type)
 	int write_size = 0;
 	void *write_data = NULL;
 	struct sdio_cmux_list_elem *list_elem;
-
-	//ADD qualcomm case
-	if (!sdio_cmux_inited)
-		return -ENODEV;
-	//ADD qualcomm case
 
 	if (id < 0 || id >= SDIO_CMUX_NUM_CHANNELS) {
 		pr_err("%s: Invalid lc_id - %d\n", __func__, id);

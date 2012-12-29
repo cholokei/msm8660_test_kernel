@@ -34,12 +34,9 @@
 #include <mach/camera.h>
 #include <linux/syscalls.h>
 #include <linux/hrtimer.h>
-#include <linux/ion.h>
+#include <linux/msm_ion.h>
 
-#if (defined(CONFIG_TARGET_SERIES_P5LTE) || defined(CONFIG_TARGET_SERIES_P8LTE))
-#include "sec_cam_pmic.h"
-#endif
-
+#include <mach/cpuidle.h>
 DEFINE_MUTEX(ctrl_cmd_lock);
 
 #define CAMERA_STOP_VIDEO 58
@@ -317,7 +314,7 @@ static int msm_pmem_table_add(struct hlist_head *ptype,
 	if (!region)
 		goto out;
 #ifdef CONFIG_MSM_MULTIMEDIA_USE_ION
-		region->handle = ion_import_fd(client_for_ion, info->fd);
+		region->handle = ion_import_dma_buf(client_for_ion, info->fd);
 		if (IS_ERR_OR_NULL(region->handle))
 			goto out1;
 		ion_phys(client_for_ion, region->handle,
@@ -650,13 +647,11 @@ static int __msm_pmem_table_del(struct msm_sync *sync,
 					pinfo->vaddr == region->info.vaddr &&
 					pinfo->fd == region->info.fd) {
 				hlist_del(node);
-				spin_unlock_irqrestore(&sync->pmem_frame_spinlock, flags); //spinlock_test
 #ifdef CONFIG_MSM_MULTIMEDIA_USE_ION
 				ion_free(client_for_ion, region->handle);
 #else
 				put_pmem_file(region->file);
 #endif
-				spin_lock_irqsave(&sync->pmem_frame_spinlock, flags); //spinlock_test
 				kfree(region);
 				CDBG("%s: type %d, vaddr  0x%p\n",
 					__func__, pinfo->type, pinfo->vaddr);
@@ -676,13 +671,11 @@ static int __msm_pmem_table_del(struct msm_sync *sync,
 				pinfo->vaddr == region->info.vaddr &&
 				pinfo->fd == region->info.fd) {
 				hlist_del(node);
-				spin_unlock_irqrestore(&sync->pmem_frame_spinlock, flags);  //spinlock_test
 #ifdef CONFIG_MSM_MULTIMEDIA_USE_ION
 				ion_free(client_for_ion, region->handle);
 #else
 				put_pmem_file(region->file);
 #endif
-				spin_lock_irqsave(&sync->pmem_frame_spinlock, flags);//spinlock_test
 				kfree(region);
 				CDBG("%s: type %d, vaddr  0x%p\n",
 					__func__, pinfo->type, pinfo->vaddr);
@@ -701,13 +694,11 @@ static int __msm_pmem_table_del(struct msm_sync *sync,
 					pinfo->vaddr == region->info.vaddr &&
 					pinfo->fd == region->info.fd) {
 				hlist_del(node);
-				spin_unlock_irqrestore(&sync->pmem_stats_spinlock, flags); //spinlock_test
 #ifdef CONFIG_MSM_MULTIMEDIA_USE_ION
 				ion_free(client_for_ion, region->handle);
 #else
 				put_pmem_file(region->file);
 #endif
-				spin_lock_irqsave(&sync->pmem_stats_spinlock, flags); //spinlock_test
 				kfree(region);
 				CDBG("%s: type %d, vaddr  0x%p\n",
 					__func__, pinfo->type, pinfo->vaddr);
@@ -1037,7 +1028,7 @@ static int msm_control(struct msm_control_device *ctrl_pmsm,
 	msm_queue_drain(&ctrl_pmsm->ctrl_q, list_control);
 	qcmd_resp = __msm_control(sync,
 				  &ctrl_pmsm->ctrl_q,
-				  qcmd, msecs_to_jiffies(4000)); // 10000-> 4000 reduce waiting time
+				  qcmd, msecs_to_jiffies(10000));
 
 	/* ownership of qcmd will be transfered to event queue */
 	qcmd = NULL;
@@ -2008,8 +1999,8 @@ static int msm_get_sensor_info(struct msm_sync *sync, void __user *arg)
 	memcpy(&info.name[0],
 		sdata->sensor_name,
 		MAX_SENSOR_NAME);
-	info.flash_enabled = MSM_CAMERA_FLASH_NONE; //sdata->flash_data->flash_type !=
-		//MSM_CAMERA_FLASH_NONE;
+	info.flash_enabled = sdata->flash_data->flash_type !=
+		MSM_CAMERA_FLASH_NONE;
 
 	/* copy back to user space */
 	if (copy_to_user((void *)arg,
@@ -2864,61 +2855,6 @@ static long msm_ioctl_config(struct file *filep, unsigned int cmd,
 		rc = pmsm->sync->sctrl.s_config(argp);
 		break;
 
-	case MSM_CAM_IOCTL_FLASH_LED_CFG: {
-		uint32_t led_state;
-		if (copy_from_user(&led_state, argp, sizeof(led_state))) {
-			ERR_COPY_FROM_USER();
-			rc = -EFAULT;
-		} else
-			rc = msm_camera_flash_set_led_state(pmsm->sync->
-					sdata->flash_data, led_state);
-		break;
-	}
-
-	case MSM_CAM_IOCTL_STROBE_FLASH_CFG: {
-		uint32_t flash_type;
-		if (copy_from_user(&flash_type, argp, sizeof(flash_type))) {
-			pr_err("msm_strobe_flash_init failed");
-			ERR_COPY_FROM_USER();
-			rc = -EFAULT;
-		} else {
-			CDBG("msm_strobe_flash_init enter");
-			rc = msm_strobe_flash_init(pmsm->sync, flash_type);
-		}
-		break;
-	}
-
-	case MSM_CAM_IOCTL_STROBE_FLASH_RELEASE:
-		if (pmsm->sync->sdata->strobe_flash_data) {
-			rc = pmsm->sync->sfctrl.strobe_flash_release(
-				pmsm->sync->sdata->strobe_flash_data, 0);
-		}
-		break;
-
-	case MSM_CAM_IOCTL_STROBE_FLASH_CHARGE: {
-		uint32_t charge_en;
-		if (copy_from_user(&charge_en, argp, sizeof(charge_en))) {
-			ERR_COPY_FROM_USER();
-			rc = -EFAULT;
-		} else
-			rc = pmsm->sync->sfctrl.strobe_flash_charge(
-			pmsm->sync->sdata->strobe_flash_data->flash_charge,
-			charge_en, pmsm->sync->sdata->strobe_flash_data->
-				flash_recharge_duration);
-		break;
-	}
-
-	case MSM_CAM_IOCTL_FLASH_CTRL: {
-		struct flash_ctrl_data flash_info;
-		if (copy_from_user(&flash_info, argp, sizeof(flash_info))) {
-			ERR_COPY_FROM_USER();
-			rc = -EFAULT;
-		} else
-			rc = msm_flash_ctrl(pmsm->sync->sdata, &flash_info);
-
-		break;
-	}
-
 	case MSM_CAM_IOCTL_ERROR_CONFIG:
 		rc = msm_error_config(pmsm->sync, argp);
 		break;
@@ -3032,9 +2968,6 @@ static long msm_ioctl_control(struct file *filep, unsigned int cmd,
 	case MSM_CAM_IOCTL_GET_CAMERA_INFO:
 		rc = msm_get_camera_info(argp);
 		break;
-	case MSM_CAM_IOCTL_EXT_CONFIG:
-	        rc = pmsm->sync->sctrl.s_ext_config(argp);
-		break;
 	default:
 		rc = msm_ioctl_common(pmsm, cmd, argp);
 		break;
@@ -3064,9 +2997,6 @@ static int __msm_release(struct msm_sync *sync)
 			sync->sctrl.s_release();
 			CDBG("%s, msm_camio_sensor_clk_off\n", __func__);
 			msm_camio_sensor_clk_off(sync->pdev);
-#if (defined(CONFIG_TARGET_SERIES_P5LTE) || defined(CONFIG_TARGET_SERIES_P8LTE))
-			cam_ldo_power_off();
-#endif
 			if (sync->sfctrl.strobe_flash_release) {
 				CDBG("%s, strobe_flash_release\n", __func__);
 				sync->sfctrl.strobe_flash_release(
@@ -3101,7 +3031,7 @@ static int __msm_release(struct msm_sync *sync)
 		msm_queue_drain(&sync->pict_q, list_pict);
 		msm_queue_drain(&sync->event_q, list_config);
 
-		wake_unlock(&sync->wake_lock);
+		pm_qos_update_request(&sync->idle_pm_qos, PM_QOS_DEFAULT_VALUE);
 		sync->apps_id = NULL;
 		sync->core_powered_on = 0;
 	}
@@ -3761,18 +3691,13 @@ static int __msm_open(struct msm_cam_device *pmsm, const char *const apps_id,
 	sync->apps_id = apps_id;
 
 	if (!sync->core_powered_on && !is_controlnode) {
-		wake_lock(&sync->wake_lock);
+		pm_qos_update_request(&sync->idle_pm_qos,
+			msm_cpuidle_get_deep_idle_latency());
 
 		msm_camvfe_fn_init(&sync->vfefn, sync);
 		if (sync->vfefn.vfe_init) {
 			sync->pp_frame_avail = 0;
 			sync->get_pic_abort = 0;
-
-#if (defined(CONFIG_TARGET_SERIES_P5LTE) || defined(CONFIG_TARGET_SERIES_P8LTE))
-			// have to enable CAM LDOs before MCLK
-			cam_ldo_power_on(sync->sdata->sensor_name);
-#endif
-
 			rc = msm_camio_sensor_clk_on(sync->pdev);
 			if (rc < 0) {
 				pr_err("%s: setting sensor clocks failed: %d\n",
@@ -3981,11 +3906,12 @@ static int msm_sync_init(struct msm_sync *sync,
 	msm_queue_init(&sync->pict_q, "pict");
 	msm_queue_init(&sync->vpe_q, "vpe");
 
-	wake_lock_init(&sync->wake_lock, WAKE_LOCK_IDLE, "msm_camera");
+	pm_qos_add_request(&sync->idle_pm_qos, PM_QOS_CPU_DMA_LATENCY,
+					   PM_QOS_DEFAULT_VALUE);
 
 	rc = msm_camio_probe_on(pdev);
 	if (rc < 0) {
-		wake_lock_destroy(&sync->wake_lock);
+		pm_qos_remove_request(&sync->idle_pm_qos);
 		return rc;
 	}
 	rc = sensor_probe(sync->sdata, &sctrl);
@@ -3998,7 +3924,7 @@ static int msm_sync_init(struct msm_sync *sync,
 		pr_err("%s: failed to initialize %s\n",
 			__func__,
 			sync->sdata->sensor_name);
-		wake_lock_destroy(&sync->wake_lock);
+		pm_qos_remove_request(&sync->idle_pm_qos);
 		return rc;
 	}
 
@@ -4017,7 +3943,7 @@ static int msm_sync_init(struct msm_sync *sync,
 
 static int msm_sync_destroy(struct msm_sync *sync)
 {
-	wake_lock_destroy(&sync->wake_lock);
+	pm_qos_remove_request(&sync->idle_pm_qos);
 	return 0;
 }
 
@@ -4119,17 +4045,12 @@ int msm_camera_drv_start(struct platform_device *dev,
 
 	pmsm = kzalloc(sizeof(struct msm_cam_device) * 4 +
 			sizeof(struct msm_sync), GFP_ATOMIC);
-	if (!pmsm) {
-		printk(KERN_ERR "%s: create class failed.\n", __func__);	//request SM
-		class_destroy(msm_class);
+	if (!pmsm)
 		return -ENOMEM;
-	}
 	sync = (struct msm_sync *)(pmsm + 4);
 
 	rc = msm_sync_init(sync, dev, sensor_probe);
 	if (rc < 0) {
-		printk(KERN_ERR "%s: create class failed..\n", __func__);	//request SM
-		class_destroy(msm_class);
 		kfree(pmsm);
 		return rc;
 	}
@@ -4137,8 +4058,6 @@ int msm_camera_drv_start(struct platform_device *dev,
 	CDBG("%s: setting camera node %d\n", __func__, camera_node);
 	rc = msm_device_init(pmsm, sync, camera_node);
 	if (rc < 0) {
-		printk(KERN_ERR "%s: create class failed...\n", __func__);	//request SM
-		class_destroy(msm_class);
 		msm_sync_destroy(sync);
 		kfree(pmsm);
 		return rc;

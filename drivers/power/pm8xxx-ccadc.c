@@ -70,34 +70,19 @@ struct pm8xxx_ccadc_chip {
 	u16			ccadc_offset;
 	int			ccadc_gain_uv;
 	unsigned int		revision;
+	unsigned int		calib_delay_ms;
 	int			eoc_irq;
-	int			r_sense;
+	int			r_sense_uohm;
+	struct delayed_work	calib_ccadc_work;
 };
 
 static struct pm8xxx_ccadc_chip *the_chip;
 
 #ifdef DEBUG
-static s64 microvolt_to_ccadc_reading_v1(s64 uv)
-{
-	return div_s64(uv * CCADC_READING_RESOLUTION_D_V1,
-				CCADC_READING_RESOLUTION_N_V1);
-}
-
-static s64 microvolt_to_ccadc_reading_v2(s64 uv)
-{
-	return div_s64(uv * CCADC_READING_RESOLUTION_D_V2,
-				CCADC_READING_RESOLUTION_N_V2);
-}
-
 static s64 microvolt_to_ccadc_reading(struct pm8xxx_ccadc_chip *chip, s64 cc)
 {
-	/*
-	 * resolution (the value of a single bit) was changed after revision 2.0
-	 * for more accurate readings
-	 */
-	return (the_chip->revision < PM8XXX_REVISION_8921_2p0) ?
-				microvolt_to_ccadc_reading_v1((s64)cc) :
-				microvolt_to_ccadc_reading_v2((s64)cc);
+	return div_s64(uv * CCADC_READING_RESOLUTION_D,
+				CCADC_READING_RESOLUTION_N);
 }
 #endif
 
@@ -214,8 +199,8 @@ static int calib_start_conv(struct pm8xxx_ccadc_chip *chip,
 			break;
 	}
 	if (i == ADC_WAIT_COUNT) {
-		pr_err("waited too long for offset eoc\n");
-		return rc;
+		pr_err("waited too long for offset eoc returning -EBUSY\n");
+		return -EBUSY;
 	}
 
 	rc = pm8xxx_readb(chip->dev->parent, ADC_ARB_SECP_DATA0, &data_lsb);
@@ -333,6 +318,11 @@ void pm8xxx_calib_ccadc(void)
 	int result_offset, result_gain;
 	u16 result;
 	int i, rc;
+
+	if (!the_chip) {
+		pr_err("chip not initialized\n");
+		return;
+	}
 
 	rc = pm8xxx_readb(the_chip->dev->parent,
 					ADC_ARB_SECP_CNTRL, &sec_cntrl);
@@ -473,11 +463,25 @@ bail:
 }
 EXPORT_SYMBOL(pm8xxx_calib_ccadc);
 
+static void calibrate_ccadc_work(struct work_struct *work)
+{
+	struct pm8xxx_ccadc_chip *chip = container_of(work,
+			struct pm8xxx_ccadc_chip, calib_ccadc_work.work);
+
+	pm8xxx_calib_ccadc();
+	schedule_delayed_work(&chip->calib_ccadc_work,
+			round_jiffies_relative(msecs_to_jiffies
+			(chip->calib_delay_ms)));
+}
+
 static irqreturn_t pm8921_bms_ccadc_eoc_handler(int irq, void *data)
 {
 	u8 data_msb, data_lsb;
 	struct pm8xxx_ccadc_chip *chip = data;
 	int rc;
+
+	if (!the_chip)
+		goto out;
 
 	pr_debug("irq = %d triggered\n", irq);
 	data_msb = chip->ccadc_offset >> 8;
@@ -487,6 +491,7 @@ static irqreturn_t pm8921_bms_ccadc_eoc_handler(int irq, void *data)
 						data_msb, data_lsb, 0);
 	disable_irq_nosync(chip->eoc_irq);
 
+out:
 	return IRQ_HANDLED;
 }
 
@@ -557,7 +562,8 @@ int pm8xxx_ccadc_get_battery_current(int *bat_current_ua)
 		return rc;
 	}
 
-	*bat_current_ua = voltage_uv * 1000/the_chip->r_sense;
+	*bat_current_ua = div_s64((s64)voltage_uv * 1000000LL,
+						the_chip->r_sense_uohm);
 	/*
 	 * ccadc reads +ve current when the battery is charging
 	 * We need to return -ve if the battery is charging
@@ -670,7 +676,8 @@ static int __devinit pm8xxx_ccadc_probe(struct platform_device *pdev)
 	chip->dev = &pdev->dev;
 	chip->revision = pm8xxx_get_revision(chip->dev->parent);
 	chip->eoc_irq = res->start;
-	chip->r_sense = pdata->r_sense;
+	chip->r_sense_uohm = pdata->r_sense_uohm;
+	chip->calib_delay_ms = pdata->calib_delay_ms;
 
 	calib_ccadc_read_offset_and_gain(chip,
 					&chip->ccadc_gain_uv,
@@ -682,10 +689,13 @@ static int __devinit pm8xxx_ccadc_probe(struct platform_device *pdev)
 		pr_err("failed to request %d irq rc= %d\n", chip->eoc_irq, rc);
 		goto free_chip;
 	}
+
 	disable_irq_nosync(chip->eoc_irq);
 
 	platform_set_drvdata(pdev, chip);
 	the_chip = chip;
+	INIT_DELAYED_WORK(&chip->calib_ccadc_work, calibrate_ccadc_work);
+	schedule_delayed_work(&chip->calib_ccadc_work, 0);
 
 	create_debugfs_entries(chip);
 

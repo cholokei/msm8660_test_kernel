@@ -87,7 +87,6 @@ extern void mca_init(void);
 extern void sbus_init(void);
 extern void prio_tree_init(void);
 extern void radix_tree_init(void);
-extern void free_initmem(void);
 #ifndef CONFIG_DEBUG_RODATA
 static inline void mark_rodata_ro(void) { }
 #endif
@@ -163,7 +162,7 @@ static int __init obsolete_checksetup(char *line)
 	p = __setup_start;
 	do {
 		int n = strlen(p->str);
-		if (!strncmp(line, p->str, n)) {
+		if (parameqn(line, p->str, n)) {
 			if (p->early) {
 				/* Already done in parse_early_param?
 				 * (Needs exact match on param part).
@@ -209,42 +208,26 @@ early_param("quiet", quiet_kernel);
 
 static int __init loglevel(char *str)
 {
-	get_option(&str, &console_loglevel);
-	return 0;
+	int newlevel;
+
+	/*
+	 * Only update loglevel value when a correct setting was passed,
+	 * to prevent blind crashes (when loglevel being set to 0) that
+	 * are quite hard to debug
+	 */
+	if (get_option(&str, &newlevel)) {
+		console_loglevel = newlevel;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
 early_param("loglevel", loglevel);
 
-#ifdef CONFIG_SAMSUNG_8X60_TABLET
-#ifdef CONFIG_SEC_DEBUG
-extern unsigned int sec_dbg_level;
-static int __init sec_debug_level(char *str)
+/* Change NUL term back to "=", to make "param" the whole string. */
+static int __init repair_env_string(char *param, char *val)
 {
-	get_option(&str, &sec_dbg_level);
-	return 0;
-}
-early_param("level", sec_debug_level);
-#endif
-#endif
-
-/*
- * Unknown boot options get handed to init, unless they look like
- * unused parameters (modprobe will find them in /proc/cmdline).
- */
-static int __init unknown_bootoption(char *param, char *val)
-{
-#if defined CONFIG_TARGET_SERIES_CELOX
-    // Enlarge vmalloc space to fix vmalloc fail.
-    if ( (strcmp(param, "vmalloc") == 0) 
-        && (*val<'5') ) // setted under 500MB
-    {
-        *val='6';
-        *(val+1)='0';
-        *(val+2)='0';
-    }
-#endif
-
-	/* Change NUL term back to "=", to make "param" the whole string. */
 	if (val) {
 		/* param=val or param="val"? */
 		if (val == param+strlen(param)+1)
@@ -256,6 +239,16 @@ static int __init unknown_bootoption(char *param, char *val)
 		} else
 			BUG();
 	}
+	return 0;
+}
+
+/*
+ * Unknown boot options get handed to init, unless they look like
+ * unused parameters (modprobe will find them in /proc/cmdline).
+ */
+static int __init unknown_bootoption(char *param, char *val)
+{
+	repair_env_string(param, val);
 
 	/* Handle obsolete-style parameters */
 	if (obsolete_checksetup(param))
@@ -293,10 +286,6 @@ static int __init unknown_bootoption(char *param, char *val)
 	}
 	return 0;
 }
-
-#ifdef CONFIG_DEBUG_PAGEALLOC
-int __read_mostly debug_pagealloc_enabled = 0;
-#endif
 
 static int __init init_setup(char *str)
 {
@@ -392,65 +381,18 @@ static noinline void __init_refok rest_init(void)
 	 * at least once to get things moving:
 	 */
 	init_idle_bootup_task(current);
-	preempt_enable_no_resched();
-	schedule();
-	preempt_disable();
-
+	schedule_preempt_disabled();
 	/* Call into cpu_idle with preempt disabled */
 	cpu_idle();
 }
-
-#if defined(CONFIG_KOR_MODEL_SHV_E120L) || defined(CONFIG_KOR_MODEL_SHV_E160L)
-int no_console = 0;
-#endif
-
-#ifdef CONFIG_SAMSUNG_8X60_TABLET
-int charging_mode_from_boot =0;
-int charging_mode_by_TA=0;
-#endif /* CONFIG_SAMSUNG_8X60_TABLET */
-
-#ifdef CONFIG_KOR_OPERATOR_LGU
-int no_uart_console = 0;
-EXPORT_SYMBOL(no_uart_console);
-#endif
 
 /* Check for early params. */
 static int __init do_early_param(char *param, char *val)
 {
 	const struct obs_kernel_param *p;
 
-#if defined CONFIG_TARGET_SERIES_CELOX
-    // Enlarge vmalloc space to fix vmalloc fail.
-    if ( (strcmp(param, "vmalloc") == 0) 
-        && (*val<'5') ) // setted under 500MB
-    {
-        *val='6';
-        *(val+1)='0';
-        *(val+2)='0';
-    }
-#endif
-
-#if defined(CONFIG_KOR_MODEL_SHV_E120L) || defined(CONFIG_KOR_MODEL_SHV_E160L)
-	if ((strcmp(param, "console") == 0) && ((strcmp(val, "null") == 0) || (strcmp(val, "NULL") == 0))){
-		no_console = 1;
-	}
-#endif	
-
-#if defined(CONFIG_SAMSUNG_8X60_TABLET)
-	/* check power off charging */
-	if ((strcmp(param, "androidboot.bootchg") == 0)) {
-		if (strcmp(val, "true") == 0)
-			charging_mode_from_boot = 1;
-	}
-	/* check power off charging cable */
-	if ((strcmp(param, "androidboot.chgsrc") == 0)) {
-		if (strcmp(val, "TA") == 0)
-			charging_mode_by_TA = 1;
-	}
-#endif
-
 	for (p = __setup_start; p < __setup_end; p++) {
-		if ((p->early && strcmp(param, p->str) == 0) ||
+		if ((p->early && parameq(param, p->str)) ||
 		    (strcmp(param, "console") == 0 &&
 		     strcmp(p->str, "earlycon") == 0)
 		) {
@@ -460,21 +402,12 @@ static int __init do_early_param(char *param, char *val)
 		}
 	}
 	/* We accept everything at this stage. */
-
-#ifdef CONFIG_KOR_OPERATOR_LGU
-		/* check uart console is disabled */
-		if ((strcmp(param, "console") == 0)) {
-			if ((strcmp(val, "null") == 0) || (strcmp(val, "NULL") == 0))
-				no_uart_console = 1;
-		}
-#endif
-	
 	return 0;
 }
 
 void __init parse_early_options(char *cmdline)
 {
-	parse_args("early options", cmdline, NULL, 0, do_early_param);
+	parse_args("early options", cmdline, NULL, 0, 0, 0, do_early_param);
 }
 
 /* Arch code calls this early on, or if not, just before other parsing. */
@@ -520,8 +453,8 @@ void __init __weak thread_info_cache_init(void)
 static void __init mm_init(void)
 {
 	/*
-	 * page_cgroup requires countinous pages as memmap
-	 * and it's bigger than MAX_ORDER unless SPARSEMEM.
+	 * page_cgroup requires contiguous pages,
+	 * bigger than MAX_ORDER unless SPARSEMEM.
 	 */
 	page_cgroup_init_flatmem();
 	mem_init();
@@ -536,13 +469,12 @@ asmlinkage void __init start_kernel(void)
 	char * command_line;
 	extern const struct kernel_param __start___param[], __stop___param[];
 
-	smp_setup_processor_id();
-
 	/*
 	 * Need to run as early as possible, to initialize the
 	 * lockdep hash:
 	 */
 	lockdep_init();
+	smp_setup_processor_id();
 	debug_objects_early_init();
 
 	/*
@@ -578,7 +510,10 @@ asmlinkage void __init start_kernel(void)
 	parse_early_param();
 	parse_args("Booting kernel", static_command_line, __start___param,
 		   __stop___param - __start___param,
-		   &unknown_bootoption);
+		   0, 0, &unknown_bootoption);
+
+	jump_label_init();
+
 	/*
 	 * These use large bootmem allocations and must precede
 	 * kmem_cache_init()
@@ -627,6 +562,9 @@ asmlinkage void __init start_kernel(void)
 	early_boot_irqs_disabled = false;
 	local_irq_enable();
 
+	/* Interrupts are enabled now so all GFP allocations are safe. */
+	gfp_allowed_mask = __GFP_BITS_MASK;
+
 	kmem_cache_init_late();
 
 	/*
@@ -658,7 +596,6 @@ asmlinkage void __init start_kernel(void)
 	}
 #endif
 	page_cgroup_init();
-	enable_debug_pagealloc();
 	debug_objects_mem_init();
 	kmemleak_init();
 	setup_per_cpu_pageset();
@@ -715,7 +652,7 @@ static void __init do_ctors(void)
 #endif
 }
 
-int initcall_debug;
+bool initcall_debug;
 core_param(initcall_debug, initcall_debug, bool, 0644);
 
 static char msgbuf[64];
@@ -769,14 +706,62 @@ int __init_or_module do_one_initcall(initcall_t fn)
 }
 
 
-extern initcall_t __initcall_start[], __initcall_end[], __early_initcall_end[];
+extern initcall_t __initcall_start[];
+extern initcall_t __initcall0_start[];
+extern initcall_t __initcall1_start[];
+extern initcall_t __initcall2_start[];
+extern initcall_t __initcall3_start[];
+extern initcall_t __initcall4_start[];
+extern initcall_t __initcall5_start[];
+extern initcall_t __initcall6_start[];
+extern initcall_t __initcall7_start[];
+extern initcall_t __initcall_end[];
+
+static initcall_t *initcall_levels[] __initdata = {
+	__initcall0_start,
+	__initcall1_start,
+	__initcall2_start,
+	__initcall3_start,
+	__initcall4_start,
+	__initcall5_start,
+	__initcall6_start,
+	__initcall7_start,
+	__initcall_end,
+};
+
+static char *initcall_level_names[] __initdata = {
+	"early parameters",
+	"core parameters",
+	"postcore parameters",
+	"arch parameters",
+	"subsys parameters",
+	"fs parameters",
+	"device parameters",
+	"late parameters",
+};
+
+static void __init do_initcall_level(int level)
+{
+	extern const struct kernel_param __start___param[], __stop___param[];
+	initcall_t *fn;
+
+	strcpy(static_command_line, saved_command_line);
+	parse_args(initcall_level_names[level],
+		   static_command_line, __start___param,
+		   __stop___param - __start___param,
+		   level, level,
+		   repair_env_string);
+
+	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
+		do_one_initcall(*fn);
+}
 
 static void __init do_initcalls(void)
 {
-	initcall_t *fn;
+	int level;
 
-	for (fn = __early_initcall_end; fn < __initcall_end; fn++)
-		do_one_initcall(*fn);
+	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++)
+		do_initcall_level(level);
 }
 
 /*
@@ -790,10 +775,11 @@ static void __init do_basic_setup(void)
 {
 	cpuset_init_smp();
 	usermodehelper_init();
-	init_tmpfs();
+	shmem_init();
 	driver_init();
 	init_irq_proc();
 	do_ctors();
+	usermodehelper_enable();
 	do_initcalls();
 }
 
@@ -801,7 +787,7 @@ static void __init do_pre_smp_initcalls(void)
 {
 	initcall_t *fn;
 
-	for (fn = __initcall_start; fn < __early_initcall_end; fn++)
+	for (fn = __initcall_start; fn < __initcall0_start; fn++)
 		do_one_initcall(*fn);
 }
 
@@ -858,10 +844,6 @@ static int __init kernel_init(void * unused)
 	 * Wait until kthreadd is all set-up.
 	 */
 	wait_for_completion(&kthreadd_done);
-
-	/* Now the scheduler is fully set up and can do blocking allocations */
-	gfp_allowed_mask = __GFP_BITS_MASK;
-
 	/*
 	 * init can allocate pages on any node
 	 */

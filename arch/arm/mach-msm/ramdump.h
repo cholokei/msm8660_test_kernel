@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -13,13 +13,18 @@
 #ifndef _RAMDUMP_HEADER
 #define _RAMDUMP_HEADER
 
+struct device;
+
 struct ramdump_segment {
 	unsigned long address;
 	unsigned long size;
 };
 
-void *create_ramdump_device(const char *dev_name);
+void *create_ramdump_device(const char *dev_name, struct device *parent);
+void destroy_ramdump_device(void *dev);
 int do_ramdump(void *handle, struct ramdump_segment *segments,
+		int nsegments);
+int do_elf_ramdump(void *handle, struct ramdump_segment *segments,
 		int nsegments);
 
 #endif

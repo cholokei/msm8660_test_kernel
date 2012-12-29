@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
+ * Copyright (c) 2010-2011, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -12,13 +12,15 @@
  */
 
 #include <linux/module.h>
-
+#include <asm/proc-fns.h>
 #include <mach/cpuidle.h>
 #include "idle.h"
 #include "pm.h"
 
 void arch_idle(void)
-{ }
+{
+	cpu_do_idle();
+}
 
 void msm_pm_set_platform_data(struct msm_pm_platform_data *data, int count)
 { }
@@ -32,4 +34,17 @@ void msm_pm_cpu_enter_lowpower(unsigned cpu)
 }
 
 void msm_pm_set_max_sleep_time(int64_t max_sleep_time_ns) { }
-EXPORT_SYMBOL(msm_pm_set_max_sleep_time);
+
+void msm_pm_set_irq_extns(struct msm_pm_irq_calls *irq_calls) {}
+
+int msm_pm_idle_prepare(struct cpuidle_device *dev,
+			struct cpuidle_driver *drv, int index)
+{
+	return -ENOSYS;
+}
+
+int msm_pm_idle_enter(enum msm_pm_sleep_mode sleep_mode)
+{
+	return -ENOSYS;
+}
+

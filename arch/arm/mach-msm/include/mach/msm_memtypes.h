@@ -35,13 +35,6 @@ enum {
 	MEMTYPE_NONE = -1,
 	MEMTYPE_SMI_KERNEL = 0,
 	MEMTYPE_SMI,
-#ifdef CONFIG_SEC_KERNEL_REBASE_FOR_PMEM_OPTIMIZATION
-	MEMTYPE_PMEM_ADSP,
-#endif
-#if defined (CONFIG_SAMSUNG_MEMORY_LAYOUT_ARRANGE)
-	MEMTYPE_PMEM_MDP,
-	MEMTYPE_PMEM_AUDIO,
-#endif
 	MEMTYPE_EBI0,
 	MEMTYPE_EBI1,
 	MEMTYPE_MAX,
@@ -73,5 +66,10 @@ struct reserve_info {
 
 extern struct reserve_info *reserve_info;
 
+int __init dt_scan_for_memory_reserve(unsigned long node, const char *uname,
+					int depth, void *data);
+int __init dt_scan_for_memory_hole(unsigned long node, const char *uname,
+					int depth, void *data);
+void adjust_meminfo(unsigned long start, unsigned long size);
 unsigned long __init reserve_memory_for_fmem(unsigned long, unsigned long);
 #endif

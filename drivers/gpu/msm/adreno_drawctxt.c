@@ -147,6 +147,7 @@ int adreno_drawctxt_create(struct kgsl_device *device,
 {
 	struct adreno_context *drawctxt;
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
+	struct adreno_ringbuffer *rb = &adreno_dev->ringbuffer;
 	int ret;
 
 	drawctxt = kzalloc(sizeof(struct adreno_context), GFP_KERNEL);
@@ -157,6 +158,7 @@ int adreno_drawctxt_create(struct kgsl_device *device,
 	drawctxt->pagetable = pagetable;
 	drawctxt->bin_base_offset = 0;
 	drawctxt->id = context->id;
+	rb->timestamp[context->id] = 0;
 
 	if (flags & KGSL_CONTEXT_PREAMBLE)
 		drawctxt->flags |= CTXT_FLAGS_PREAMBLE;
@@ -167,6 +169,14 @@ int adreno_drawctxt_create(struct kgsl_device *device,
 	if (flags & KGSL_CONTEXT_PER_CONTEXT_TS)
 		drawctxt->flags |= CTXT_FLAGS_PER_CONTEXT_TS;
 
+	if (flags & KGSL_CONTEXT_USER_GENERATED_TS) {
+		if (!(flags & KGSL_CONTEXT_PER_CONTEXT_TS)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		drawctxt->flags |= CTXT_FLAGS_USER_GENERATED_TS;
+	}
+
 	ret = adreno_dev->gpudev->ctxt_create(adreno_dev, drawctxt);
 	if (ret)
 		goto err;
@@ -174,6 +184,12 @@ int adreno_drawctxt_create(struct kgsl_device *device,
 	kgsl_sharedmem_writel(&device->memstore,
 			KGSL_MEMSTORE_OFFSET(drawctxt->id, ref_wait_ts),
 			KGSL_INIT_REFTIMESTAMP);
+	kgsl_sharedmem_writel(&device->memstore,
+			KGSL_MEMSTORE_OFFSET(drawctxt->id, ts_cmp_enable), 0);
+	kgsl_sharedmem_writel(&device->memstore,
+			KGSL_MEMSTORE_OFFSET(drawctxt->id, soptimestamp), 0);
+	kgsl_sharedmem_writel(&device->memstore,
+			KGSL_MEMSTORE_OFFSET(drawctxt->id, eoptimestamp), 0);
 
 	context->devctxt = drawctxt;
 	return 0;
@@ -213,11 +229,13 @@ void adreno_drawctxt_destroy(struct kgsl_device *device,
 				     CTXT_FLAGS_GMEM_SHADOW |
 				     CTXT_FLAGS_STATE_SHADOW);
 
+		drawctxt->flags |= CTXT_FLAGS_BEING_DESTROYED;
+
 		adreno_drawctxt_switch(adreno_dev, NULL, 0);
 	}
 
 	if (device->state != KGSL_STATE_HUNG)
-		adreno_idle(device, KGSL_TIMEOUT_DEFAULT);
+		adreno_idle(device);
 
 	kgsl_sharedmem_free(&drawctxt->gpustate);
 	kgsl_sharedmem_free(&drawctxt->context_gmem_shadow.gmemshadow);
@@ -279,8 +297,10 @@ void adreno_drawctxt_switch(struct adreno_device *adreno_dev,
 		return;
 	}
 
-	KGSL_CTXT_INFO(device, "from %p to %p flags %d\n",
-			adreno_dev->drawctxt_active, drawctxt, flags);
+	KGSL_CTXT_INFO(device, "from %d to %d flags %d\n",
+		adreno_dev->drawctxt_active ?
+		adreno_dev->drawctxt_active->id : 0,
+		drawctxt ? drawctxt->id : 0, flags);
 
 	/* Save the old context */
 	adreno_dev->gpudev->ctxt_save(adreno_dev, adreno_dev->drawctxt_active);

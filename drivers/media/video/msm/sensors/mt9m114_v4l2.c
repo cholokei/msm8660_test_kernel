@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2011-2012, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -1184,36 +1184,17 @@ static struct msm_sensor_output_info_t mt9m114_dimensions[] = {
 	},
 };
 
-static struct msm_camera_csid_vc_cfg mt9m114_cid_cfg[] = {
-	{0, CSI_YUV422_8, CSI_DECODE_8BIT},
-	{1, CSI_EMBED_DATA, CSI_DECODE_8BIT},
-};
-
-static struct msm_camera_csi2_params mt9m114_csi_params = {
-	.csid_params = {
-		.lane_assign = 0xe4,
-		.lane_cnt = 1,
-		.lut_params = {
-			.num_cid = 2,
-			.vc_cfg = mt9m114_cid_cfg,
-		},
-	},
-	.csiphy_params = {
-		.lane_cnt = 1,
-		.settle_cnt = 0x14,
-	},
-};
-
-static struct msm_camera_csi2_params *mt9m114_csi_params_array[] = {
-	&mt9m114_csi_params,
-	&mt9m114_csi_params,
-};
-
 static struct msm_sensor_output_reg_addr_t mt9m114_reg_addr = {
 	.x_output = 0xC868,
 	.y_output = 0xC86A,
 	.line_length_pclk = 0xC868,
 	.frame_length_lines = 0xC86A,
+};
+
+static enum msm_camera_vreg_name_t mt9m114_veg_seq[] = {
+	CAM_VIO,
+	CAM_VDIG,
+	CAM_VANA,
 };
 
 static struct msm_sensor_id_info_t mt9m114_id_info = {
@@ -1238,9 +1219,50 @@ static struct msm_camera_i2c_client mt9m114_sensor_i2c_client = {
 	.addr_type = MSM_CAMERA_I2C_WORD_ADDR,
 };
 
+static const struct of_device_id mt9m114_dt_match[] = {
+	{.compatible = "qcom,mt9m114", .data = &mt9m114_s_ctrl},
+	{}
+};
+
+MODULE_DEVICE_TABLE(of, mt9m114_dt_match);
+
+static struct platform_driver mt9m114_platform_driver = {
+	.driver = {
+		.name = "qcom,mt9m114",
+		.owner = THIS_MODULE,
+		.of_match_table = mt9m114_dt_match,
+	},
+};
+
+static int32_t mt9m114_platform_probe(struct platform_device *pdev)
+{
+	int32_t rc = 0;
+	const struct of_device_id *match;
+	match = of_match_device(mt9m114_dt_match, &pdev->dev);
+	rc = msm_sensor_platform_probe(pdev, match->data);
+	return rc;
+}
+
 static int __init msm_sensor_init_module(void)
 {
+	int32_t rc = 0;
+	rc = platform_driver_probe(&mt9m114_platform_driver,
+		mt9m114_platform_probe);
+	if (!rc)
+		return rc;
 	return i2c_add_driver(&mt9m114_i2c_driver);
+}
+
+
+static void __exit msm_sensor_exit_module(void)
+{
+	if (mt9m114_s_ctrl.pdev) {
+		msm_sensor_free_sensor_data(&mt9m114_s_ctrl);
+		platform_driver_unregister(&mt9m114_platform_driver);
+	} else {
+		i2c_del_driver(&mt9m114_i2c_driver);
+	}
+	return;
 }
 
 static struct v4l2_subdev_core_ops mt9m114_subdev_core_ops = {
@@ -1269,6 +1291,7 @@ static struct msm_sensor_fn_t mt9m114_func_tbl = {
 	.sensor_config = msm_sensor_config,
 	.sensor_power_up = msm_sensor_power_up,
 	.sensor_power_down = msm_sensor_power_down,
+	.sensor_get_csi_params = msm_sensor_get_csi_params,
 };
 
 static struct msm_sensor_reg_t mt9m114_regs = {
@@ -1288,10 +1311,13 @@ static struct msm_sensor_ctrl_t mt9m114_s_ctrl = {
 	.num_v4l2_ctrl = ARRAY_SIZE(mt9m114_v4l2_ctrl_info),
 	.sensor_i2c_client = &mt9m114_sensor_i2c_client,
 	.sensor_i2c_addr = 0x90,
+	.vreg_seq = mt9m114_veg_seq,
+	.num_vreg_seq = ARRAY_SIZE(mt9m114_veg_seq),
 	.sensor_output_reg_addr = &mt9m114_reg_addr,
 	.sensor_id_info = &mt9m114_id_info,
 	.cam_mode = MSM_SENSOR_MODE_INVALID,
-	.csi_params = &mt9m114_csi_params_array[0],
+	.min_delay = 30,
+	.power_seq_delay = 60,
 	.msm_sensor_mutex = &mt9m114_mut,
 	.sensor_i2c_driver = &mt9m114_i2c_driver,
 	.sensor_v4l2_subdev_info = mt9m114_subdev_info,
@@ -1301,5 +1327,6 @@ static struct msm_sensor_ctrl_t mt9m114_s_ctrl = {
 };
 
 module_init(msm_sensor_init_module);
+module_exit(msm_sensor_exit_module);
 MODULE_DESCRIPTION("Aptina 1.26MP YUV sensor driver");
 MODULE_LICENSE("GPL v2");

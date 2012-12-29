@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2010-2012, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -15,12 +15,16 @@
 
 #include <linux/interrupt.h>
 #include <linux/clk.h>
+#include <linux/list.h>
+#include <linux/regulator/consumer.h>
 #include <mach/socinfo.h>
 
 extern pgprot_t     pgprot_kernel;
+extern struct bus_type msm_iommu_sec_bus_type;
 
 /* Domain attributes */
 #define MSM_IOMMU_DOMAIN_PT_CACHEABLE	0x1
+#define MSM_IOMMU_DOMAIN_PT_SECURE	0x2
 
 /* Mask for the cache policy attribute */
 #define MSM_IOMMU_CP_MASK		0x03
@@ -33,6 +37,11 @@ extern pgprot_t     pgprot_kernel;
  */
 #define MAX_NUM_MIDS	32
 
+/* Maximum number of SMT entries allowed by the system */
+#define MAX_NUM_SMR	128
+
+#define MAX_NUM_BFB_REGS	32
+
 /**
  * struct msm_iommu_dev - a single IOMMU hardware instance
  * name		Human-readable name given to this IOMMU HW instance
@@ -41,6 +50,7 @@ extern pgprot_t     pgprot_kernel;
 struct msm_iommu_dev {
 	const char *name;
 	int ncb;
+	int ttbr_split;
 };
 
 /**
@@ -58,26 +68,54 @@ struct msm_iommu_ctx_dev {
 	int mids[MAX_NUM_MIDS];
 };
 
+/**
+ * struct msm_iommu_bfb_settings - a set of IOMMU BFB tuning parameters
+ * regs		An array of register offsets to configure
+ * data		Values to write to corresponding registers
+ * length	Number of valid entries in the offset/val arrays
+ */
+struct msm_iommu_bfb_settings {
+	unsigned int regs[MAX_NUM_BFB_REGS];
+	unsigned int data[MAX_NUM_BFB_REGS];
+	int length;
+};
 
 /**
  * struct msm_iommu_drvdata - A single IOMMU hardware instance
  * @base:	IOMMU config port base address (VA)
+ * @glb_base:	IOMMU config port base address for global register space (VA)
  * @ncb		The number of contexts on this IOMMU
  * @irq:	Interrupt number
  * @clk:	The bus clock for this IOMMU hardware instance
  * @pclk:	The clock for the IOMMU bus interconnect
+ * @aclk:	Alternate clock for this IOMMU core, if any
+ * @name:	Human-readable name of this IOMMU device
+ * @gdsc:	Regulator needed to power this HW block (v2 only)
+ * @bfb_settings: Optional BFB performance tuning parameters
+ * @dev:	Struct device this hardware instance is tied to
+ * @list:	List head to link all iommus together
  *
  * A msm_iommu_drvdata holds the global driver data about a single piece
  * of an IOMMU hardware instance.
  */
 struct msm_iommu_drvdata {
 	void __iomem *base;
-	int irq;
+	void __iomem *glb_base;
 	int ncb;
+	int ttbr_split;
 	struct clk *clk;
 	struct clk *pclk;
+	struct clk *aclk;
 	const char *name;
+	struct regulator *gdsc;
+	struct msm_iommu_bfb_settings *bfb_settings;
+	int sec_id;
+	struct device *dev;
+	struct list_head list;
 };
+
+void msm_iommu_add_drv(struct msm_iommu_drvdata *drv);
+void msm_iommu_remove_drv(struct msm_iommu_drvdata *drv);
 
 /**
  * struct msm_iommu_ctx_drvdata - an IOMMU context bank instance
@@ -85,6 +123,10 @@ struct msm_iommu_drvdata {
  * @pdev:		Platform device associated wit this HW instance
  * @attached_elm:	List element for domains to track which devices are
  *			attached to them
+ * @attached_domain	Domain currently attached to this context (if any)
+ * @name		Human-readable name of this context device
+ * @sids		List of Stream IDs mapped to this context
+ * @nsid		Number of Stream IDs mapped to this context
  *
  * A msm_iommu_ctx_drvdata holds the driver data for a single context bank
  * within each IOMMU hardware instance
@@ -93,6 +135,10 @@ struct msm_iommu_ctx_drvdata {
 	int num;
 	struct platform_device *pdev;
 	struct list_head attached_elm;
+	struct iommu_domain *attached_domain;
+	const char *name;
+	u32 sids[MAX_NUM_SMR];
+	unsigned int nsid;
 };
 
 /*
@@ -101,6 +147,60 @@ struct msm_iommu_ctx_drvdata {
  * message and dump useful IOMMU registers.
  */
 irqreturn_t msm_iommu_fault_handler(int irq, void *dev_id);
+irqreturn_t msm_iommu_fault_handler_v2(int irq, void *dev_id);
+
+enum {
+	PROC_APPS,
+	PROC_GPU,
+	PROC_MAX
+};
+
+/* Expose structure to allow kgsl iommu driver to use the same structure to
+ * communicate to GPU the addresses of the flag and turn variables.
+ */
+struct remote_iommu_petersons_spinlock {
+	uint32_t flag[PROC_MAX];
+	uint32_t turn;
+};
+
+#ifdef CONFIG_MSM_IOMMU
+void *msm_iommu_lock_initialize(void);
+void msm_iommu_mutex_lock(void);
+void msm_iommu_mutex_unlock(void);
+#else
+static inline void *msm_iommu_lock_initialize(void)
+{
+	return NULL;
+}
+static inline void msm_iommu_mutex_lock(void) { }
+static inline void msm_iommu_mutex_unlock(void) { }
+#endif
+
+#ifdef CONFIG_MSM_IOMMU_GPU_SYNC
+void msm_iommu_remote_p0_spin_lock(void);
+void msm_iommu_remote_p0_spin_unlock(void);
+
+#define msm_iommu_remote_lock_init() _msm_iommu_remote_spin_lock_init()
+#define msm_iommu_remote_spin_lock() msm_iommu_remote_p0_spin_lock()
+#define msm_iommu_remote_spin_unlock() msm_iommu_remote_p0_spin_unlock()
+#else
+#define msm_iommu_remote_lock_init()
+#define msm_iommu_remote_spin_lock()
+#define msm_iommu_remote_spin_unlock()
+#endif
+
+/* Allows kgsl iommu driver to acquire lock */
+#define msm_iommu_lock() \
+	do { \
+		msm_iommu_mutex_lock(); \
+		msm_iommu_remote_spin_lock(); \
+	} while (0)
+
+#define msm_iommu_unlock() \
+	do { \
+		msm_iommu_remote_spin_unlock(); \
+		msm_iommu_mutex_unlock(); \
+	} while (0)
 
 #ifdef CONFIG_MSM_IOMMU
 /*
@@ -116,10 +216,30 @@ static inline struct device *msm_iommu_get_ctx(const char *ctx_name)
 }
 #endif
 
-#endif
+/*
+ * Function to program the global registers of an IOMMU securely.
+ * This should only be called on IOMMUs for which kernel programming
+ * of global registers is not possible
+ */
+int msm_iommu_sec_program_iommu(int sec_id);
 
-static inline int msm_soc_version_supports_iommu(void)
+static inline int msm_soc_version_supports_iommu_v1(void)
 {
+#ifdef CONFIG_OF
+	struct device_node *node;
+
+	node = of_find_compatible_node(NULL, NULL, "qcom,msm-smmu-v2");
+	if (node) {
+		of_node_put(node);
+		return 0;
+	}
+
+	node = of_find_compatible_node(NULL, NULL, "qcom,msm-smmu-v1");
+	if (node) {
+		of_node_put(node);
+		return 1;
+	}
+#endif
 	if (cpu_is_msm8960() &&
 	    SOCINFO_VERSION_MAJOR(socinfo_get_version()) < 2)
 		return 0;
@@ -131,3 +251,4 @@ static inline int msm_soc_version_supports_iommu(void)
 	}
 	return 1;
 }
+#endif

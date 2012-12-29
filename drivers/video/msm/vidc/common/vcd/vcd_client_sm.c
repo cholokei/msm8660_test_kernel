@@ -96,8 +96,8 @@ static u32 vcd_encode_start_in_open(struct vcd_clnt_ctxt *cctxt)
 		 cctxt->in_buf_pool.validated != cctxt->in_buf_pool.count) ||
 	    cctxt->out_buf_pool.validated !=
 	    cctxt->out_buf_pool.count) {
-		VCD_MSG_ERROR("Buffer pool is not completely setup yet");
-		return VCD_ERR_BAD_STATE;
+		VCD_MSG_HIGH("%s: Buffer pool is not completely setup yet",
+			__func__);
 	}
 
 	rc = vcd_sched_add_client(cctxt);
@@ -541,31 +541,37 @@ static u32 vcd_set_property_cmn
 			}
 			break;
 		}
+	case VCD_I_SET_TURBO_CLK:
+	{
+		if (cctxt->sched_clnt_hdl)
+			rc = vcd_set_perf_turbo_level(cctxt);
+		break;
+	}
 	case VCD_I_INTRA_PERIOD:
-	   {
-		  struct vcd_property_i_period *iperiod =
-			 (struct vcd_property_i_period *)prop_val;
-		  cctxt->bframe = iperiod->b_frames;
-		  break;
-	   }
+		{
+			struct vcd_property_i_period *iperiod =
+				(struct vcd_property_i_period *)prop_val;
+			cctxt->bframe = iperiod->b_frames;
+			break;
+		}
 	case VCD_REQ_PERF_LEVEL:
 		rc = vcd_req_perf_level(cctxt,
-			(struct vcd_property_perf_level *)prop_val);
+				(struct vcd_property_perf_level *)prop_val);
 		break;
 	case VCD_I_VOP_TIMING_CONSTANT_DELTA:
-	   {
-		   struct vcd_property_vop_timing_constant_delta *delta =
-			   (struct vcd_property_vop_timing_constant_delta *)
-			   prop_val;
-		   if (delta->constant_delta > 0) {
-			cctxt->time_frame_delta = delta->constant_delta;
-			rc = VCD_S_SUCCESS;
-		   } else {
-			VCD_MSG_ERROR("Frame delta must be positive");
-			rc = VCD_ERR_ILLEGAL_PARM;
-		   }
-		   break;
-	   }
+		{
+			struct vcd_property_vop_timing_constant_delta *delta =
+				prop_val;
+
+			if (delta->constant_delta > 0) {
+				cctxt->time_frame_delta = delta->constant_delta;
+				rc = VCD_S_SUCCESS;
+			} else {
+				VCD_MSG_ERROR("Frame delta must be positive");
+				rc = VCD_ERR_ILLEGAL_PARM;
+			}
+			break;
+		}
 	default:
 		{
 			break;
@@ -1616,7 +1622,6 @@ void vcd_do_client_state_transition(struct vcd_clnt_ctxt *cctxt,
 	if (!cctxt || to_state >= VCD_CLIENT_STATE_MAX) {
 		VCD_MSG_ERROR("Bad parameters. cctxt=%p, to_state=%d",
 			      cctxt, to_state);
-        return ;
 	}
 
 	state_ctxt = &cctxt->clnt_state;

@@ -173,10 +173,6 @@ err_out:
 	return NULL;
 }
 
-struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu)
-{
-	return __cpufreq_cpu_get(cpu, 0);
-}
 EXPORT_SYMBOL_GPL(cpufreq_cpu_get);
 
 static struct cpufreq_policy *cpufreq_cpu_get_sysfs(unsigned int cpu)
@@ -188,11 +184,6 @@ void cpufreq_cpu_put(struct cpufreq_policy *data)
 {
 	kobject_put(&data->kobj);
 	module_put(cpufreq_driver->owner);
-}
-
-void cpufreq_cpu_put(struct cpufreq_policy *data)
-{
-	__cpufreq_cpu_put(data, 0);
 }
 EXPORT_SYMBOL_GPL(cpufreq_cpu_put);
 
@@ -413,7 +404,6 @@ show_one_cpuinfomaxfreq(cpuinfo_max_freq, cpuinfo.max_freq);
 show_one(cpuinfo_max_freq, max);
 #endif
 show_one(cpuinfo_min_freq, cpuinfo.min_freq);
-show_one(cpuinfo_max_freq, cpuinfo.max_freq);
 show_one(cpuinfo_transition_latency, cpuinfo.transition_latency);
 show_one(scaling_min_freq, min);
 show_one(scaling_max_freq, max);
@@ -2118,7 +2108,7 @@ int cpufreq_unregister_driver(struct cpufreq_driver *driver)
 
 	if (!cpufreq_driver || (driver != cpufreq_driver))
 		return -EINVAL;
-	
+
 	pr_debug("unregistering driver %s\n", driver->name);
 
 	sysdev_driver_unregister(&cpu_sysdev_class, &cpufreq_sysdev_driver);

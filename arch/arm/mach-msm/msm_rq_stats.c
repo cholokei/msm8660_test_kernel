@@ -37,26 +37,6 @@
 #define DEFAULT_RQ_POLL_JIFFIES 1
 #define DEFAULT_DEF_TIMER_JIFFIES 5
 
-static unsigned init_done = 0;
-
-#ifdef CONFIG_MSM_MPDEC
-unsigned int get_rq_info(void)
-{
-	unsigned long flags = 0;
-        unsigned int rq = 0;
-
-        spin_lock_irqsave(&rq_lock, flags);
-
-        rq = rq_info.rq_avg;
-        rq_info.rq_avg = 0;
-
-        spin_unlock_irqrestore(&rq_lock, flags);
-
-        return rq;
-}
-EXPORT_SYMBOL(get_rq_info);
-#endif
-
 static void def_work_fn(struct work_struct *work)
 {
 	int64_t diff;
@@ -66,9 +46,7 @@ static void def_work_fn(struct work_struct *work)
 	rq_info.def_interval = (unsigned int) diff;
 
 	/* Notify polling threads on change of value */
-	/* HTC Change: call sysfs_notify only when init is done */
-	if (init_done)
-		sysfs_notify(rq_info.kobj, NULL, "def_timer_ms");
+	sysfs_notify(rq_info.kobj, NULL, "def_timer_ms");
 }
 
 #ifdef CONFIG_SEC_DVFS_DUAL
@@ -168,19 +146,25 @@ void dual_boost(unsigned int boost_on)
 }
 #endif
 
-static void def_work_fn(struct work_struct *work)
+static unsigned init_done = 0;
+
+#ifdef CONFIG_MSM_MPDEC
+unsigned int get_rq_info(void)
 {
-	int64_t diff;
+	unsigned long flags = 0;
+        unsigned int rq = 0;
 
-	diff = ktime_to_ns(ktime_get()) - rq_info.def_start_time;
-	do_div(diff, 1000 * 1000);
-	rq_info.def_interval = (unsigned int) diff;
+        spin_lock_irqsave(&rq_lock, flags);
 
-	/* Notify polling threads on change of value */
-	/* HTC Change: call sysfs_notify only when init is done */
-	if (init_done)
-		sysfs_notify(rq_info.kobj, NULL, "def_timer_ms");
+        rq = rq_info.rq_avg;
+        rq_info.rq_avg = 0;
+
+        spin_unlock_irqrestore(&rq_lock, flags);
+
+        return rq;
 }
+EXPORT_SYMBOL(get_rq_info);
+#endif
 
 static ssize_t show_run_queue_avg(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)

@@ -44,6 +44,7 @@
 
 #include "sii9234_driver.h"
 
+//#define CONFIG_MHL_SWING_LEVEL	//test
 #ifdef CONFIG_MHL_SWING_LEVEL
 #include <linux/ctype.h>
 #endif
@@ -99,11 +100,29 @@ static ssize_t sii9234_swing_test_store(struct device *dev,
 	sii9234->pdata->swing_level = sii9234->pdata->swing_level
 							| (data << 3) | clk;
 	sprintf(buf, "mhl_store_value : 0x%x\n", sii9234->pdata->swing_level);
+	pr_err("%s() ***** NEW SWING LEVEL(0x%02X) *****\n", __func__, sii9234->pdata->swing_level);
 	return size;
 }
 
-static CLASS_ATTR(swing, 0664,
+#if 0//org
+static CLASS_ATTR(swing, 0666,
 		sii9234_swing_test_show, sii9234_swing_test_store);
+#else//test
+static void hdmi_msm_dump_regs_222(const char *prefix)
+{
+	print_hex_dump(KERN_INFO, prefix, DUMP_PREFIX_OFFSET, 32, 4,
+		(void *)0xFD800000/*MSM_HDMI_BASE*/, 0x0334, false);
+}
+static ssize_t sii9234_hexdump_hdmi_msm(struct device *dev,
+				struct device_attribute *attr,
+					const char *buf, size_t size)
+{
+	hdmi_msm_dump_regs_222("HDMI_DUMP: ");
+	return size;
+}
+static CLASS_ATTR(swing, 0666,
+		sii9234_swing_test_show, sii9234_hexdump_hdmi_msm);
+#endif//test
 #endif
 
 int fsa9480_mhl_chg_status_cb(void)
@@ -922,6 +941,14 @@ static void sii9234_mhl_tx_ctl_int(struct sii9234_data *sii9234)
 	mhl_tx_write_reg(sii9234, MHL_TX_MHLTX_CTL2_REG, 0xFC);
 	mhl_tx_write_reg(sii9234, MHL_TX_MHLTX_CTL4_REG,
 					sii9234->pdata->swing_level);
+	pr_info("%s() ***** SWING LEVEL(0x%02X) WRITTEN *****\n", __func__, sii9234->pdata->swing_level);
+#ifdef CONFIG_MHL_SWING_LEVEL
+{
+	u8 value = 0;
+	mhl_tx_read_reg(sii9234, MHL_TX_MHLTX_CTL4_REG, &value);
+	pr_info("%s() ***** SWING LEVEL(0x%02X) READ *****\n", __func__, value);
+}
+#endif
 	mhl_tx_write_reg(sii9234, MHL_TX_MHLTX_CTL7_REG, 0x0C);
 }
 
@@ -962,9 +989,6 @@ int rsen_state_timer_out(struct sii9234_data *sii9234)
 		goto err_exit;
 	sii9234->rsen = value & RSEN_STATUS;
 
-#if defined(CONFIG_KOR_MODEL_SHV_E160S) || defined(CONFIG_KOR_MODEL_SHV_E160K) || defined (CONFIG_KOR_MODEL_SHV_E160L) || defined (CONFIG_JPN_MODEL_SC_05D)
-	pr_info("sii9234: jgk:%s() - ignore MHL_TX_SYSSTAT_REG\n", __func__);
-#else
 	if (value & RSEN_STATUS) {
 		pr_info("sii9234: MHL cable connected.. RESN High\n");
 	} else {
@@ -985,7 +1009,6 @@ int rsen_state_timer_out(struct sii9234_data *sii9234)
 			goto err_exit;
 		}
 	}
-#endif
 	return ret;
 
 err_exit:
